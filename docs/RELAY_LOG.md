@@ -46,3 +46,18 @@ Short, dated entries: what you did, what's broken, what the next person should d
   permanent errors, parses multi-source/multi-table responses); DR3 reader accepts column-name aliases and saves
   unparseable tables to cache/.../_unparsed/; `scripts/inspect_datalink.py` dumps real responses.
 - **Next:** run `inspect_datalink.py --xmatch data/tebc_dr3_xmatch.ecsv`, then rerun verification with --limit 20.
+
+## 2026-11-04: first verification run (20 shortest-period TEBC systems)
+- `inspect_datalink.py`: DATAMODEL_GAIA accepted and parsed (wide, per-source arrays); DATAMODEL_STANDARD is one
+  file per source, one row per transit, with the source ID only in the file name.
+- Result: 18/20 offsets constrained, |z|<3 for 72%; DR3 period 'double' for 6, not a DR3 EB for 14.
+  These are P = 0.13-0.17 d, below the ~0.22 d contact-binary limit: likely TEBC half-period aliases.
+- Fixes: (1) DATAMODEL_GAIA photometry_flag_*_reject / *_unavailable now set `rejected` (they were ignored, which
+  is where the 10-35x BP/RP points came from); (2) DATAMODEL_STANDARD parsed, ID from file name; (3) normalised
+  flux > 2 flagged as rejected (MAX_NORM_FLUX); (4) TESS normalised by its out-of-eclipse median like Gaia
+  (it used the all-points median, so it floated above Gaia for deep/contact systems); (5) robust y-limits with
+  off-scale triangles; zoom panels capped at ±0.5 phase; (6) TESS upward outliers clipped at 5σ (no lower clip);
+  (7) verification tries 2P when DR3 says 'double' and adopts it if chi2_red improves by >10%;
+  (8) `03_verify_dr3.py --sample/--seed/--min-period/--max-period`.
+- **Next:** rerun with `--sample 50 --seed 1 --min-period 0.25` for a representative check; refine ephemerides
+  from all TESS sectors (multiple tracks in folded TESS = period error across sectors).

@@ -22,13 +22,53 @@ def _oot_mask(ephem, t):
     return m if m.sum() >= 5 else np.ones(len(t), bool)
 
 
-def normalize_band(ephem, tab, band):
+# Normalised fluxes above this are treated as rejected. Eclipses only remove light, so a
+# point at twice the median cannot be eclipse signal; such points are usually BP/RP
+# contamination or failed photometry that slipped past the pipeline flags.
+MAX_NORM_FLUX = 2.0
+
+
+def normalize_band(ephem, tab, band, max_norm=MAX_NORM_FLUX):
+    """Normalised (t, flux, err, rejected) for one band.
+
+    Flux is divided by the median of non-rejected points outside eclipse (all
+    non-rejected points when eclipse widths are unknown or cover most of the orbit).
+    Points brighter than `max_norm` after normalising are added to `rejected`.
+    """
     sel = (tab["band"] == band) & np.isfinite(tab["flux"])
     t = np.asarray(tab["btjd"][sel]); f = np.asarray(tab["flux"][sel])
-    e = np.asarray(tab["flux_err"][sel]); rej = np.asarray(tab["rejected"][sel])
+    e = np.asarray(tab["flux_err"][sel]); rej = np.asarray(tab["rejected"][sel]).astype(bool)
     oot = _oot_mask(ephem, t) & ~rej
-    ref = np.median(f[oot]) if oot.any() else np.median(f)
-    return t, f / ref, e / ref, rej
+    ref = np.median(f[oot]) if oot.any() else (np.median(f[~rej]) if (~rej).any() else np.median(f))
+    fn = f / ref
+    return t, fn, e / ref, rej | (fn > max_norm)
+
+
+def normalize_tess(ephem, t, flux):
+    """TESS flux divided by its out-of-eclipse median: the same reference as the Gaia bands.
+
+    (A plain median would include the eclipses, pushing the curve above the Gaia
+    points for deep or contact systems.)
+    """
+    ok = np.isfinite(flux)
+    oot = _oot_mask(ephem, t) & ok
+    ref = np.nanmedian(flux[oot]) if oot.sum() >= 5 else np.nanmedian(flux[ok])
+    return flux / ref
+
+
+def _display_limits(tess_flux, gaia_good):
+    """y-limits from the TESS light curve (0.2-99.8 percentiles) and all good Gaia points."""
+    vals = []
+    if tess_flux is not None and np.isfinite(tess_flux).any():
+        vals += list(np.nanpercentile(tess_flux, [0.2, 99.8]))
+    for f in gaia_good:
+        if len(f):
+            vals += [np.nanmin(f), np.nanmax(f)]
+    if not vals:
+        return 0.0, 1.5
+    lo, hi = min(vals), max(vals)
+    pad = 0.06 * max(hi - lo, 0.02)
+    return lo - pad, hi + pad
 
 
 def summarize(ephem, tab, band="G"):
@@ -77,6 +117,9 @@ def atlas_page(ephem, gaia_tab, tess=None, title="", bands=("G", "BP", "RP"), ou
     Row 1: TESS light curve folded on the ephemeris, Gaia epochs on top.
     Row 2: zooms on primary and secondary eclipse.
     Row 3: Gaia G epochs vs calendar time, coloured by phase (shows the sampling).
+
+    The y-range comes from the TESS light curve and the good Gaia points; anything
+    outside it (usually rejected points) is drawn as a triangle at the plot edge.
     """
     fig = plt.figure(figsize=(10, 9), constrained_layout=True)
     gs = fig.add_gridspec(3, 2, height_ratios=[1.3, 1, 0.8])
@@ -84,40 +127,64 @@ def atlas_page(ephem, gaia_tab, tess=None, title="", bands=("G", "BP", "RP"), ou
     ax_p = fig.add_subplot(gs[1, 0], sharey=ax_full)
     ax_s = fig.add_subplot(gs[1, 1], sharey=ax_full)
     ax_t = fig.add_subplot(gs[2, :])
+    sec = ephem.secondary_phase
+    panels = lambda ph: ((ax_full, ph), (ax_p, ph), (ax_s, _wrap(ph - sec)))
 
+    tnorm = None
     if tess is not None:
-        tt, tf = tess[0], tess[1]
+        tt, tf = np.asarray(tess[0], float), np.asarray(tess[1], float)
+        tnorm = normalize_tess(ephem, tt, tf)
+    data = {}
+    for band in bands:
+        if np.any(gaia_tab["band"] == band):
+            data[band] = normalize_band(ephem, gaia_tab, band)
+    lo, hi = _display_limits(tnorm, [d[1][~d[3]] for d in data.values()])
+
+    if tnorm is not None:
         tph = ephem.phase(tt)
-        for ax, x in ((ax_full, tph), (ax_p, tph), (ax_s, _wrap(tph - ephem.secondary_phase))):
-            ax.plot(x, tf / np.nanmedian(tf), ",", color="0.6", alpha=0.5, rasterized=True,
+        inr = (tnorm > lo) & (tnorm < hi)
+        for ax, x in panels(tph):
+            ax.plot(x[inr], tnorm[inr], ",", color="0.6", alpha=0.5, rasterized=True,
                     label="TESS" if ax is ax_full else None)
 
-    for band in bands:
-        if not np.any(gaia_tab["band"] == band):
-            continue
-        t, f, e, rej = normalize_band(ephem, gaia_tab, band)
+    n_off = 0
+    for band, (t, f, e, rej) in data.items():
         ph, sph = ephem.phase(t), ephem.phase_sigma(t)
         st = BAND_STYLE.get(band, {})
-        for ax, x in ((ax_full, ph), (ax_p, ph), (ax_s, _wrap(ph - ephem.secondary_phase))):
-            ax.errorbar(x[~rej], f[~rej], yerr=e[~rej], xerr=sph[~rej], fmt="o", lw=0.8,
+        inr = (f > lo) & (f < hi)
+        good, bad = ~rej & inr, rej & inr
+        off_hi, off_lo = f >= hi, f <= lo
+        n_off += int(off_hi.sum() + off_lo.sum())
+        for ax, x in panels(ph):
+            ax.errorbar(x[good], f[good], yerr=e[good], xerr=sph[good], fmt="o", lw=0.8,
                         mec="k", mew=0.4, color=st.get("color"), ms=st.get("ms", 4),
                         zorder=st.get("zorder", 3),
                         label=f"Gaia {band} ({(~rej).sum()})" if ax is ax_full else None)
-            if rej.any():
-                ax.plot(x[rej], f[rej], "o", mfc="none", mec=st.get("color"), ms=st.get("ms", 4),
+            if bad.any():
+                ax.plot(x[bad], f[bad], "o", mfc="none", mec=st.get("color"), ms=st.get("ms", 4),
                         label=f"{band} rejected ({rej.sum()})" if ax is ax_full else None)
+            edge = 0.015 * (hi - lo)
+            if off_hi.any():
+                ax.plot(x[off_hi], np.full(off_hi.sum(), hi - edge), "^", color=st.get("color"), ms=6,
+                        mec="k", mew=0.4, zorder=7, clip_on=False)
+            if off_lo.any():
+                ax.plot(x[off_lo], np.full(off_lo.sum(), lo + edge), "v", color=st.get("color"), ms=6,
+                        mec="k", mew=0.4, zorder=7, clip_on=False)
             if band == "G" and "rejected_by_variability" in gaia_tab.colnames:
                 sel_g = (gaia_tab["band"] == "G") & np.isfinite(gaia_tab["flux"])
-                vr = np.asarray(gaia_tab["rejected_by_variability"][sel_g]).astype(bool)
+                vr = np.asarray(gaia_tab["rejected_by_variability"][sel_g]).astype(bool) & inr
                 if vr.any():
                     ax.plot(x[vr], f[vr], "o", mfc="none", mec="k", ms=st.get("ms", 6) + 5, mew=1.0, zorder=6,
                             label=f"G var.-pipeline outlier ({vr.sum()})" if ax is ax_full else None)
+    if n_off:
+        ax_full.plot([], [], "^", color="0.5", mec="k", mew=0.4, label=f"off-scale ({n_off})")
+    ax_full.set_ylim(lo, hi)
 
     w1 = ephem.primary_width or 0.05
     w2 = ephem.secondary_width or w1
-    ax_p.set_xlim(-2 * w1, 2 * w1)
-    ax_s.set_xlim(-2 * w2, 2 * w2)
-    ax_s.set_xlabel(f"Phase − {ephem.secondary_phase:.3f}"); ax_p.set_xlabel("Phase")
+    ax_p.set_xlim(-min(2 * w1, 0.5), min(2 * w1, 0.5))
+    ax_s.set_xlim(-min(2 * w2, 0.5), min(2 * w2, 0.5))
+    ax_s.set_xlabel(f"Phase − {sec:.3f}"); ax_p.set_xlabel("Phase")
     ax_full.set_xlim(-0.5, 0.5)
     ax_full.set_ylabel("Normalised flux")
     ax_full.set_xlabel("Phase")
@@ -125,8 +192,8 @@ def atlas_page(ephem, gaia_tab, tess=None, title="", bands=("G", "BP", "RP"), ou
     ax_full.legend(fontsize=8, ncol=2, loc="lower left", framealpha=0.85)
     ax_full.set_title(f"{title}   P = {ephem.period:.6f} d", fontsize=11)
 
-    if np.any(gaia_tab["band"] == "G"):
-        t, f, e, rej = normalize_band(ephem, gaia_tab, "G")
+    if "G" in data:
+        t, f, e, rej = data["G"]
         yr = Time(t + 2457000.0, format="jd", scale="tdb").decimalyear
         sc = ax_t.scatter(yr[~rej], f[~rej], c=ephem.phase(t)[~rej], cmap="twilight",
                           vmin=-0.5, vmax=0.5, s=18, edgecolor="k", linewidth=0.3)

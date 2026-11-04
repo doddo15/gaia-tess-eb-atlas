@@ -39,6 +39,13 @@ _ALIASES = {
 }
 
 
+_WIDE_SPEC = {
+    "G": ("g_transit_time", "g_transit_flux", "g_transit_flux_error", "g_transit_mag", "variability_flag_g_reject"),
+    "BP": ("bp_obs_time", "bp_flux", "bp_flux_error", "bp_mag", "variability_flag_bp_reject"),
+    "RP": ("rp_obs_time", "rp_flux", "rp_flux_error", "rp_mag", "variability_flag_rp_reject"),
+}
+
+
 def _find(cols, key):
     low = {c.lower(): c for c in cols}
     for a in _ALIASES[key]:
@@ -59,7 +66,10 @@ def _bool(col, n):
 def standardize_dr3(tab):
     """Convert ONE source's DR3 epoch photometry (long or wide format) to the standard schema.
 
-    Only `rejected_by_photometry` (or a non-finite flux) sets `rejected`.
+    `rejected` comes from DR3's photometric processing: rejected_by_photometry (long and
+    DATAMODEL_STANDARD formats) or the per-transit photometry_flag_*_reject /
+    *_unavailable arrays (DATAMODEL_GAIA; G is rejected only when no AF CCD
+    contributed), plus non-finite or non-positive fluxes.
     `rejected_by_variability` is kept as its own column: the variability
     pipeline's outlier rejection often removes exactly the in-eclipse points,
     so they stay in the analysis and are counted separately.
@@ -78,30 +88,57 @@ def standardize_dr3(tab):
             "rejected": _bool(tab[c] if (c := _find(cols, "rejected_by_photometry")) else None, n),
             "rejected_by_variability": _bool(tab[c] if (c := _find(cols, "rejected_by_variability")) else None, n),
         })
-    elif "g_transit_time" in cols:
+    elif "g_transit_time" in cols and tab["g_transit_time"].dtype != object and np.ndim(tab["g_transit_time"][0]) == 0:
+        # DATAMODEL_STANDARD: one row per transit for ONE source, bands side by side as scalars.
+        n = len(tab)
+        num = lambda c: np.ma.filled(np.ma.asarray(tab[c]).astype(float), np.nan) if c in cols else np.full(n, np.nan)
+        rbp = _bool(tab["rejected_by_photometry"] if "rejected_by_photometry" in cols else None, n)
         parts = []
-        spec = {"G": ("g_transit_time", "g_transit_flux", "g_transit_flux_error", "g_transit_mag", "variability_flag_g_reject"),
-                "BP": ("bp_obs_time", "bp_flux", "bp_flux_error", "bp_mag", "variability_flag_bp_reject"),
-                "RP": ("rp_obs_time", "rp_flux", "rp_flux_error", "rp_mag", "variability_flag_rp_reject")}
+        for band, (tc, fc, ec, mc, rc) in _WIDE_SPEC.items():
+            if tc not in cols:
+                continue
+            parts.append(Table({
+                "band": [band] * n, "time_gaia": num(tc), "flux": num(fc), "flux_err": num(ec), "mag": num(mc),
+                "rejected": rbp.copy(),
+                "rejected_by_variability": _bool(tab[rc] if rc in cols else None, n),
+            }))
+        out = vstack(parts)
+    elif "g_transit_time" in cols:
+        # DATAMODEL_GAIA: one row per source, per-transit arrays.
+        parts = []
         for row in tab:
-            for band, (tc, fc, ec, mc, rc) in spec.items():
+            arr = lambda c: np.ma.filled(np.ma.asarray(row[c]).astype(float), np.nan)
+            barr = lambda c: np.ma.filled(np.ma.asarray(row[c]), False).astype(bool)
+            nt = len(arr("g_transit_time"))
+            flag = lambda c: barr(c) if c in cols else np.zeros(nt, bool)
+            # G: rejected when no AF CCD contributed (all AF CCDs rejected or unavailable).
+            af_bad = np.ones(nt, bool)
+            for k in range(1, 10):
+                af_bad &= flag(f"photometry_flag_af{k}_reject") | flag(f"photometry_flag_af{k}_unavailable")
+            if not any(f"photometry_flag_af{k}_reject" in cols for k in range(1, 10)):
+                af_bad = np.zeros(nt, bool)
+            if "g_transit_n_obs" in cols:
+                af_bad |= np.ma.filled(np.ma.asarray(row["g_transit_n_obs"]), 0).astype(int) == 0
+            hard = {"G": af_bad,
+                    "BP": flag("photometry_flag_bp_reject") | flag("photometry_flag_bp_unavailable"),
+                    "RP": flag("photometry_flag_rp_reject") | flag("photometry_flag_rp_unavailable")}
+            for band, (tc, fc, ec, mc, rc) in _WIDE_SPEC.items():
                 if tc not in cols:
                     continue
-                arr = lambda c: np.ma.filled(np.ma.asarray(row[c]).astype(float), np.nan) if c in cols else None
                 t = arr(tc); f = arr(fc)
-                e = arr(ec) if ec in cols else np.full(len(t), np.nan)
-                m = arr(mc) if mc in cols else np.full(len(t), np.nan)
                 parts.append(Table({
-                    "band": [band] * len(t), "time_gaia": t, "flux": f, "flux_err": e, "mag": m,
-                    "rejected": np.zeros(len(t), bool),
-                    "rejected_by_variability": (np.ma.filled(np.ma.asarray(row[rc]), False).astype(bool)
-                                                if rc in cols else np.zeros(len(t), bool)),
+                    "band": [band] * len(t), "time_gaia": t, "flux": f,
+                    "flux_err": arr(ec) if ec in cols else np.full(len(t), np.nan),
+                    "mag": arr(mc) if mc in cols else np.full(len(t), np.nan),
+                    "rejected": hard[band],
+                    "rejected_by_variability": flag(rc),
                 }))
         out = vstack(parts) if parts else Table(names=STANDARD_COLUMNS[:2])
     else:
         raise ValueError("Unrecognised epoch-photometry columns: " + ", ".join(cols[:20]))
 
-    out["rejected"] = np.asarray(out["rejected"]) | ~np.isfinite(np.asarray(out["flux"], float))
+    fl = np.asarray(out["flux"], float)
+    out["rejected"] = np.asarray(out["rejected"]) | ~np.isfinite(fl) | (fl <= 0)
     good = np.isfinite(np.asarray(out["time_gaia"], float))
     out = out[good]
     out["btjd"] = gaia_time_to_btjd(out["time_gaia"])
@@ -119,7 +156,7 @@ def parse_dr3_result(res, unparsed_dir=None):
     out = {}
     for key, tab in iter_tables(res):
         try:
-            for sid, sub in split_by_source(tab).items():
+            for sid, sub in split_by_source(tab, key).items():
                 out[sid] = standardize_dr3(sub)
         except Exception as exc:
             if unparsed_dir:

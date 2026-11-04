@@ -153,6 +153,12 @@ def phase_offset_scan(ephem, gaia_tab, template, band="G", span=None, n=801, min
     if len(t) < 10:
         return out
     med = np.median(f); f, e = f / med, e / med
+    from .plotting import MAX_NORM_FLUX
+    keep = f < MAX_NORM_FLUX                      # brightenings cannot be eclipse signal
+    t, f, e = t[keep], f[keep], e[keep]
+    out["n_points"] = int(len(t))
+    if len(t) < 10:
+        return out
     ph = ephem.phase(t)
     sig = float(np.median(ephem.phase_sigma(t)))
     out["sigma_phase_gaia"] = sig
@@ -182,6 +188,27 @@ def phase_offset_scan(ephem, gaia_tab, template, band="G", span=None, n=801, min
                n_in_eclipse=n_in, constrained=bool(d.max() / infl > min_dchi2 and 0 < k < n - 1 and n_in >= 1))
     out["z"] = float(shifts[k] / np.hypot(tot, sig))
     return out
+
+
+def _analyse(row, factor, lc, tab, n_boot):
+    """Ephemeris (catalog period x factor), eclipse geometry from TESS, and offset scan."""
+    from .catalogs import row_to_ephemeris
+    from .ephemeris import Ephemeris
+
+    base = row_to_ephemeris(row)
+    if factor != 1:
+        base = Ephemeris(base.period * factor, base.t0, base.period_err * factor, base.t0_err)
+    if lc is None:
+        return base, None, {}
+    geom = measure_eclipses(base, lc[0], lc[1])
+    pick = lambda k, d: geom[k] if np.isfinite(geom[k]) else d
+    eph = Ephemeris(base.period, base.t0, base.period_err, base.t0_err,
+                    primary_width=pick("primary_width", base.primary_width),
+                    secondary_phase=pick("secondary_phase", base.secondary_phase),
+                    secondary_width=pick("secondary_width", base.secondary_width))
+    off = phase_offset_scan(eph, tab, tess_template(eph, lc[0], lc[1]),
+                            boot_templates=bootstrap_templates(eph, lc[0], lc[1], n=n_boot))
+    return eph, geom, off
 
 
 def _truthy(v):
@@ -218,7 +245,7 @@ def verify_dr3(cat, xmatch, out_dir, fetcher=None, lc_getter=None, cache_dir="ca
     for x in keep:
         row = by_eb[x["eb_id"]]; sid = int(x["dr3_source_id"]); tic = int(row["tic_id"])
         rec = {"eb_id": x["eb_id"], "tic_id": tic, "gaia_dr3_id": sid, "period": float(row["period"]),
-               "has_dr3_epochs": sid in epochs, "has_tess": False}
+               "has_dr3_epochs": sid in epochs, "has_tess": False, "adopted_period_factor": 1}
         ratio, pclass = period_agreement(row["period"], x["dr3_eb_frequency"] if "dr3_eb_frequency" in xmatch.colnames else np.nan)
         rec.update(dr3_period_ratio=ratio, period_check=pclass)
         if sid not in epochs:
@@ -229,22 +256,29 @@ def verify_dr3(cat, xmatch, out_dir, fetcher=None, lc_getter=None, cache_dir="ca
             except Exception:
                 lc_cache[tic] = None
         lc = lc_cache[tic]
-        overrides = {}
-        if lc is not None:
-            rec["has_tess"] = True
-            geom = measure_eclipses(row_to_ephemeris(row), lc[0], lc[1])
+        rec["has_tess"] = lc is not None
+
+        eph, geom, off = _analyse(row, 1, lc, epochs[sid], n_boot)
+        # DR3 says the period is twice the catalog's: a common catalog alias for contact
+        # binaries with near-equal eclipses. Try 2P and adopt it if it fits clearly better.
+        if pclass == "double" and lc is not None:
+            eph2, geom2, off2 = _analyse(row, 2, lc, epochs[sid], n_boot)
+            better = (off2.get("constrained") and np.isfinite(off2.get("chi2_red", np.nan))
+                      and off2["chi2_red"] < 0.9 * off.get("chi2_red", np.inf))
+            alt = (eph, geom, off) if better else (eph2, geom2, off2)
+            rec.update({f"alt_offset_{k}": v for k, v in alt[2].items()})
+            rec["alt_period_factor"] = 1 if better else 2
+            if better:
+                eph, geom, off = eph2, geom2, off2
+                rec["adopted_period_factor"] = 2
+        if geom is not None:
             rec.update({f"meas_{k}": geom[k] for k in ("primary_width", "primary_depth", "secondary_phase",
                                                       "secondary_width", "contact_like")})
-            overrides = {k: geom[k] for k in ("primary_width", "secondary_phase", "secondary_width")
-                         if np.isfinite(geom[k])}
-        eph = row_to_ephemeris(row, **overrides)
         rec.update(summarize(eph, epochs[sid]))
-        if lc is not None:
-            off = phase_offset_scan(eph, epochs[sid], tess_template(eph, lc[0], lc[1]),
-                                    boot_templates=bootstrap_templates(eph, lc[0], lc[1], n=n_boot))
-            rec.update({f"offset_{k}": v for k, v in off.items()})
+        rec.update({f"offset_{k}": v for k, v in off.items()})
         if pages:
-            atlas_page(eph, epochs[sid], tess=lc, title=f"{x['eb_id']} / Gaia DR3 {sid}",
+            tag = "  (2× catalog P)" if rec["adopted_period_factor"] == 2 else ""
+            atlas_page(eph, epochs[sid], tess=lc, title=f"{x['eb_id']} / Gaia DR3 {sid}{tag}",
                        out=out_dir / f"{x['eb_id']}.png")
         rows.append(rec)
 

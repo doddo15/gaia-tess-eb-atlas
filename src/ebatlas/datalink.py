@@ -68,11 +68,20 @@ def iter_tables(res):
             yield k, (t.to_table() if hasattr(t, "to_table") else Table(t))
 
 
-def split_by_source(tab):
-    """{source_id: rows} for a table holding one or many sources."""
+def split_by_source(tab, key=None):
+    """{source_id: rows} for a table holding one or many sources.
+
+    DATAMODEL_STANDARD files hold one source each and carry the ID only in the
+    file name (e.g. EPOCH_PHOTOMETRY_Gaia_DR3_2037415700780608128.xml), so
+    without a source_id column the ID is taken from `key`.
+    """
+    import re
     cols = {c.lower(): c for c in tab.colnames}
     sc = cols.get("source_id")
     if sc is None:
-        raise ValueError(f"No source_id column in DataLink table: {tab.colnames[:15]}")
+        m = re.findall(r"(\d{10,})", str(key or ""))
+        if m:
+            return {int(m[-1]): tab}
+        raise ValueError(f"No source_id column or ID in file name ({key}): {tab.colnames[:15]}")
     sid = np.asarray(tab[sc], dtype=np.int64)
     return {int(s): tab[sid == s] for s in np.unique(sid)}

@@ -155,8 +155,8 @@ def fetch_dr4_epoch_photometry(source_ids, cache_dir="cache/dr4_epoch_photometry
         res, _ = datalink.load(block, p["retrieval_type"], p["data_release"], structures=p["structures"],
                                retries=retries, pause=pause)
         got = set()
-        for _key, raw in iter_tables(res):
-            for sid, sub in split_by_source(raw).items():
+        for key, raw in iter_tables(res):
+            for sid, sub in split_by_source(raw, key).items():
                 standardize_dr4(sub).write(cache / f"{sid}.ecsv", overwrite=True)
                 got.add(sid)
         new_empty = set(block) - got

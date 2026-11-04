@@ -33,9 +33,11 @@ Gaia DR3 published epoch photometry only for about 11.7 million sources in its p
 
 ## The plan
 
-1. **Now:** `python scripts/01_prepare_dr3_xmatch.py data/TEBC.csv data/tebc_dr3_xmatch.ecsv`. This caches DR3 IDs and DR3 context, including which TEBC systems already had DR3 epoch photometry.
-2. **Release day:** confirm `DR4_XMATCH` and `DR4_DATALINK` against the published schema, then run `scripts/02_release_day.sh --limit 10`, then the full run. Fetches are cached per source and resume after interruptions.
-3. **Rehearse anytime:** `python examples/release_day_rehearsal.py data/TEBC.csv` (offline).
+1. **Now:** `python scripts/01_prepare_dr3_xmatch.py data/TEBC.csv data/tebc_dr3_xmatch.ecsv [--tic-dr3 <file>]`. With `--tic-dr3`, TIC→DR3 comes from the published TIC/Gaia DR3 cross-match ([Hardegree-Ullman et al. 2026, RNAAS 10, 77](https://doi.org/10.3847/2515-5172/ae5b91); table on ExoFOP), read lazily so the 33 GB file never loads whole. This caches DR3 IDs and DR3 context, including which TEBC systems already had DR3 epoch photometry.
+2. **Verify on DR3 (now):** `python scripts/03_verify_dr3.py data/TEBC.csv data/tebc_dr3_xmatch.ecsv --out verify_dr3/ --limit 20`, then without `--limit`. For every TEBC system with DR3 epoch photometry, this checks DR3's EB period against TESS, fits the phase offset of the Gaia eclipses against the TESS light curve (should be consistent with zero given the ephemeris error), and counts in-eclipse points, including those DR3's variability pipeline rejected.
+3. **Release day:** confirm `DR4_XMATCH` and `DR4_DATALINK` against the published schema, then run `scripts/02_release_day.sh --limit 10`, then the full run. Fetches are cached per source and resume after interruptions.
+4. **Rehearse anytime:** `python examples/release_day_rehearsal.py data/TEBC.csv` (offline).
+
 
 ## Quick start
 
@@ -65,14 +67,18 @@ Two consequences follow. First, TEBC ephemerides should be refit using all TESS 
 Reproduce with `python examples/tebc_ephemeris_precision.py data/TEBC.csv`.
 
 ## Things that bite
-
-- **Time systems.** Gaia epochs are BJD(TCB) − 2455197.5; TESS is BJD(TDB) − 2457000. TCB − TDB is ~19 s during the mission. Easy enough if you know it
+ 
+- **Time systems.** Gaia epochs are BJD(TCB) − 2455197.5; TESS is BJD(TDB) − 2457000. TCB − TDB is ~19 s during the mission. Harmless for folding, fatal for timing.
 - **Ephemeris drift.** Propagating a TESS ephemeris back to 2014 can span thousands of cycles. `Ephemeris.phase_sigma` and `is_reliable_at` flag targets whose fold is not trustworthy at Gaia epochs.
+- **Normalisation.** Every band, TESS included, is divided by its own out-of-eclipse median, so all curves share a baseline. Normalised fluxes above 2 (`MAX_NORM_FLUX`) are treated as rejected: eclipses only remove light.
+- **Half-period aliases.** Near-equal eclipses can make a catalog list half the true period (common below P ≈ 0.22 d). When DR3's EB period is twice the catalog's, verification also folds at 2P and adopts it if it fits clearly better (`adopted_period_factor`).
+- **DR3 variability rejections.** DR3's `rejected_by_variability` often flags real in-eclipse points. We keep those points, ring them on the pages, and count them (`*_var_rejected_in_eclipse`); only `rejected_by_photometry` removes a point.
 - **Outlier rejection.** In DR4, outlier rejection affects only the mean photometry; epoch fluxes keep in-eclipse points. We count in-eclipse transits Gaia flagged as outliers, and plot (not drop) transits with no usable flux. The variability pipeline's epoch flags are a separate product.
-- **Few points per eclipse.** With ~70 transits and an eclipse lasting 1–2% of the orbit, expect only ~1 point per eclipse for many detached systems. Wide eclipses and short periods fare best, but this is sort of why I was interested in this idea: the ability to *catch* eclipses somewhat unexpectedly.
-- **Cross-match ambiguity.** DR2 sources can split into several DR3 sources; `dr2_to_dr3` keeps all candidates and marks the closest as `best`.
+- **Few points per eclipse.** With ~70 transits and an eclipse lasting 1–2% of the orbit, expect only ~1 point per eclipse for many detached systems. Wide eclipses and short periods fare best.
+- **Cross-match ambiguity.** DR2 sources can split into several DR3 sources; we keep the closest and record `n_dr3_candidates`. `passes_hu26_cuts` applies the published table's cuts (< 100 mas, |ΔG| ≤ 0.2) to every match, and `shared_dr3_id` marks DR3 sources claimed by two TICs (a known TIC v7→v8 artifact).
 - **Catalog quirks (TEBC).** The export has a trailing comma on every row, zero-padded TIC IDs, swapped `tic__glat`/`tic__glon` columns, a −1 sentinel in `morph_coeff`, six TICs with two entries, and no eclipse widths or secondary phases. `read_tebc` handles all of these, and `measure_eclipses` supplies the geometry from TESS.
 - **Bandpasses.** TESS and Gaia G eclipse depths differ; don't expect the points to land exactly on the TESS curve.
+
 
 ## Roadmap
 
