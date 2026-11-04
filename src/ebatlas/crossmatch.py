@@ -1,7 +1,8 @@
 """TIC -> Gaia cross-matching and Gaia-side context queries.
 
 Two stages:
-  1. Pre-release (runs now): TIC v8.2 (Gaia DR2 IDs) -> gaiadr3.dr2_neighbourhood -> DR3,
+  1. Pre-release (runs now): TIC -> DR3 from the published Hardegree-Ullman et al. (2026)
+     table when available, else TIC v8.2 (Gaia DR2 IDs) -> gaiadr3.dr2_neighbourhood -> DR3,
      plus DR3 context. `prepare_dr3_crossmatch` writes this to a file.
   2. Release day: DR3 -> DR4 via the DR4 `dr3_neighbourhood` table, joined with
      `all_source_flags.has_epoch_photometry`. `dr3_to_dr4` does it in one
@@ -123,41 +124,139 @@ def positional_dr3_match(ra, dec, radius_arcsec=2.0):
     return (int(t["source_id"][0]), float(t["sep_arcsec"][0])) if len(t) else (None, np.nan)
 
 
-def prepare_dr3_crossmatch(cat, positional_fallback=True):
+# --- Stage 1 option: the published TIC / Gaia DR3 cross-match ------------------------
+# Hardegree-Ullman et al. 2026, RNAAS 10, 77 (ExoFOP, doi:10.26134/exofop6).
+# Built from TIC v8.2 + gaiadr3.dr2_neighbourhood with cuts: angular distance < 100 mas
+# and |delta G| <= 0.2 mag. Column names in the download are not known here, so they are
+# auto-detected; pass `columns=` to override.
+HU26_CUTS = {"max_dist_mas": 100.0, "max_abs_dmag": 0.2}
+_HU26_PATTERNS = {
+    "tic_id": ("tic",),
+    "gaia_dr2_id": ("dr2",),
+    "dr3_source_id": ("dr3",),
+    "angular_distance_mas": ("dist", "angular", "sep"),
+    "g_mag_difference": ("mag", "dg", "delta"),
+}
+
+
+def _detect_columns(names):
+    low = {n: n.lower().replace(" ", "_") for n in names}
+    out = {}
+    for std, keys in _HU26_PATTERNS.items():
+        for n, l in low.items():
+            if n in out.values():
+                continue
+            if any(k in l for k in keys):
+                out[std] = n
+                break
+    missing = {"tic_id", "dr3_source_id"} - set(out)
+    if missing:
+        raise ValueError(f"Could not find columns {missing} among {list(names)}; pass columns=")
+    return out
+
+
+def load_tic_dr3_table(path, tic_ids, columns=None):
+    """Rows of the TIC/DR3 cross-match table for the given TIC IDs, without loading 33 GB.
+
+    Uses Polars' lazy scan (CSV, gzipped CSV, Parquet; globs allowed), so only
+    matching rows are materialised. Returns Table(tic_id, gaia_dr2_id, dr3_source_id,
+    angular_distance_mas, g_mag_difference).
+    """
+    import polars as pl
+
+    path = str(path)
+    lf = pl.scan_parquet(path) if path.endswith(".parquet") else pl.scan_csv(path, infer_schema_length=10000)
+    names = lf.collect_schema().names()
+    cols = columns or _detect_columns(names)
+    tics = [int(t) for t in np.unique(np.asarray(tic_ids))]
+    df = (lf.select([pl.col(c).alias(k) for k, c in cols.items()])
+            .filter(pl.col("tic_id").cast(pl.Int64).is_in(tics))
+            .collect())
+    t = Table({k: df[k].to_numpy() for k in df.columns})
+    for k in ("tic_id", "gaia_dr2_id", "dr3_source_id"):
+        if k in t.colnames:
+            t[k] = np.asarray(t[k]).astype(np.int64)
+    return t
+
+
+def _best_per(key, t, dist_col):
+    """{key: (best_row, n_rows)} choosing the smallest distance."""
+    out = {}
+    for r in t:
+        k = int(r[key]); d = float(r[dist_col]) if dist_col in t.colnames else 0.0
+        if k not in out:
+            out[k] = (r, 1, d)
+        else:
+            best, n, bd = out[k]
+            out[k] = (r, n + 1, d) if d < bd else (best, n + 1, bd)
+    return {k: (v[0], v[1]) for k, v in out.items()}
+
+
+def prepare_dr3_crossmatch(cat, positional_fallback=True, tic_dr3=None):
     """Stage 1: one row per catalog EB with its DR3 source_id and DR3 context.
 
-    Columns: eb_id, tic_id, gaia_dr2_id, dr3_source_id, n_dr3_candidates,
-    match_method ('tic_dr2' | 'positional' | 'none'), plus DR3 context
-    (ruwe, non_single_star, has_epoch_photometry, best_class_name, dr3_eb_frequency).
+    Match order, recorded in `match_method`:
+      'hu26'        -- the published TIC/DR3 table (pass a path as `tic_dr3`),
+      'tic_dr2'     -- TIC -> DR2 (MAST) -> gaiadr3.dr2_neighbourhood, closest match, no cuts,
+      'positional'  -- nearest DR3 source within 2 arcsec of the TIC position,
+      'none'.
+    `passes_hu26_cuts` applies the paper's quality cuts to every match that has
+    distance and magnitude difference, so query matches can be compared fairly.
+    `shared_dr3_id` marks DR3 sources claimed by more than one TIC (TIC v7->v8 artifact).
     """
-    tic2 = tic_to_gaia_dr2(np.unique(cat["tic_id"]))
-    t2 = {int(r["tic_id"]): int(r["gaia_dr2_id"]) for r in tic2}
-    nb = dr2_to_dr3(list(t2.values())) if t2 else Table()
-    ncand, best = {}, {}
-    for r in nb:
-        d2 = int(r["dr2_source_id"])
-        ncand[d2] = ncand.get(d2, 0) + 1
-        if r["best"]:
-            best[d2] = int(r["dr3_source_id"])
+    tics = np.unique(np.asarray(cat["tic_id"]))
+    found = {}   # tic -> dict
+    if tic_dr3 is not None:
+        hu = tic_dr3 if isinstance(tic_dr3, Table) else load_tic_dr3_table(tic_dr3, tics)
+        for tic, (r, n) in _best_per("tic_id", hu, "angular_distance_mas").items():
+            found[tic] = {"gaia_dr2_id": int(r["gaia_dr2_id"]) if "gaia_dr2_id" in hu.colnames else -1,
+                          "dr3_source_id": int(r["dr3_source_id"]), "n_dr3_candidates": n,
+                          "angular_distance_mas": float(r["angular_distance_mas"]) if "angular_distance_mas" in hu.colnames else np.nan,
+                          "g_mag_difference": float(r["g_mag_difference"]) if "g_mag_difference" in hu.colnames else np.nan,
+                          "match_method": "hu26"}
+
+    todo = [int(t) for t in tics if int(t) not in found]
+    if todo:
+        tic2 = tic_to_gaia_dr2(todo)
+        t2 = {int(r["tic_id"]): int(r["gaia_dr2_id"]) for r in tic2}
+        nb = dr2_to_dr3(list(t2.values())) if t2 else Table()
+        per = _best_per("dr2_source_id", nb, "angular_distance") if len(nb) else {}
+        for tic, d2 in t2.items():
+            if d2 in per:
+                r, n = per[d2]
+                found[tic] = {"gaia_dr2_id": d2, "dr3_source_id": int(r["dr3_source_id"]), "n_dr3_candidates": n,
+                              "angular_distance_mas": float(r["angular_distance"]),
+                              "g_mag_difference": float(r["magnitude_difference"]), "match_method": "tic_dr2"}
 
     rows = []
     for r in cat:
-        tic = int(r["tic_id"]); d2 = t2.get(tic)
-        d3, method = (best.get(d2), "tic_dr2") if d2 is not None else (None, "none")
-        if d3 is None and positional_fallback and np.isfinite(r["ra"]):
-            d3, _ = positional_dr3_match(float(r["ra"]), float(r["dec"]))
-            method = "positional" if d3 is not None else "none"
-        rows.append({"eb_id": r["eb_id"], "tic_id": tic, "gaia_dr2_id": d2 if d2 is not None else -1,
-                     "dr3_source_id": d3 if d3 is not None else -1,
-                     "n_dr3_candidates": ncand.get(d2, 0), "match_method": method})
+        tic = int(r["tic_id"])
+        rec = {"eb_id": r["eb_id"], "tic_id": tic, "gaia_dr2_id": -1, "dr3_source_id": -1, "n_dr3_candidates": 0,
+               "angular_distance_mas": np.nan, "g_mag_difference": np.nan, "match_method": "none"}
+        rec.update(found.get(tic, {}))
+        if rec["dr3_source_id"] < 0 and positional_fallback and np.isfinite(r["ra"]):
+            d3, sep = positional_dr3_match(float(r["ra"]), float(r["dec"]))
+            if d3 is not None:
+                rec.update(dr3_source_id=d3, n_dr3_candidates=1, angular_distance_mas=sep * 1000.0,
+                           match_method="positional")
+        rows.append(rec)
     xm = Table(rows=rows)
-    ids = sorted({int(x) for x in xm["dr3_source_id"] if x > 0})
+    dist, dmag = np.asarray(xm["angular_distance_mas"], float), np.asarray(xm["g_mag_difference"], float)
+    xm["passes_hu26_cuts"] = (dist < HU26_CUTS["max_dist_mas"]) & (np.abs(dmag) <= HU26_CUTS["max_abs_dmag"])
+    d3 = np.asarray(xm["dr3_source_id"])
+    tic_per_d3 = {}
+    for t, d in zip(np.asarray(xm["tic_id"]), d3):
+        if d > 0:
+            tic_per_d3.setdefault(int(d), set()).add(int(t))
+    xm["shared_dr3_id"] = [d > 0 and len(tic_per_d3[int(d)]) > 1 for d in d3]
+
+    ids = sorted({int(x) for x in d3 if x > 0})
     ctx = dr3_context(ids)
     by = {int(c["source_id"]): c for c in ctx}
     for col in ("ruwe", "non_single_star", "has_epoch_photometry", "best_class_name", "dr3_eb_frequency"):
         vals = []
-        for d3 in xm["dr3_source_id"]:
-            c = by.get(int(d3))
+        for d in d3:
+            c = by.get(int(d))
             v = c[col] if c is not None and col in c.colnames else None
             missing = v is None or np.ma.is_masked(v)
             default = {"best_class_name": "", "has_epoch_photometry": False}.get(col, np.nan)

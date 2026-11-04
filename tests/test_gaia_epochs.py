@@ -11,6 +11,7 @@ def test_long_format():
                  "rejected_by_photometry": [False, False, True, False],
                  "rejected_by_variability": [False, True, False, False]})
     out = standardize_dr3(tab)
-    assert out.colnames == STANDARD_COLUMNS
+    assert out.colnames == STANDARD_COLUMNS + ["rejected_by_variability"]
     assert len(out) == 3                       # NaN time dropped
-    assert list(out["rejected"]) == [False, True, True]
+    assert list(out["rejected"]) == [False, False, True]               # photometry rejection only
+    assert list(out["rejected_by_variability"]) == [False, True, False]  # kept, flagged separately

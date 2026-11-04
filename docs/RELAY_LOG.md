@@ -24,3 +24,16 @@ Short, dated entries: what you did, what's broken, what the next person should d
 - `synthetic.make_dr4_epoch_photometry` + `examples/release_day_rehearsal.py`: offline end-to-end rehearsal; recovered eclipse widths within ~5% and an eccentric secondary phase.
 - `crossmatch`: stage 1 `prepare_dr3_crossmatch` (run now), stage 2 `dr3_to_dr4` (one uploaded-table query).
 - **Next:** run stage 1 with network access; confirm DR4 schema names on release day.
+
+## Pre-relay: published TIC/DR3 table
+- `crossmatch.load_tic_dr3_table` reads the Hardegree-Ullman et al. (2026) TIC/Gaia DR3 table lazily (Polars); `prepare_dr3_crossmatch(tic_dr3=...)` uses it first, then queries, then position.
+- New columns: `match_method`, `angular_distance_mas`, `g_mag_difference`, `passes_hu26_cuts`, `shared_dr3_id`.
+- **Next:** download the table (or a TEBC-only extract) and run stage 1 with `--tic-dr3`.
+
+## Pre-relay: DR3 verification
+- `verify.py` + `scripts/03_verify_dr3.py`: period check vs. DR3 vari_eclipsing_binary, phase-offset scan of a TESS template
+  against Gaia G (Fourier outside eclipses, running mean inside, bootstrap template errors), eclipse recovery.
+- Error calibration on synthetics: pull widths 0.92–1.15 (2-min and 10-min TESS cadence, eclipse widths 0.02–0.06).
+- DR3 reader change: `rejected_by_variability` no longer removes points; it is a separate column, ringed on pages and counted.
+- DR3 fetch is now cached per source (cache/dr3_epoch_photometry/).
+- **Next:** run stage 1, then `03_verify_dr3.py --limit 20`; inspect pages before the full run.

@@ -57,6 +57,11 @@ def summarize(ephem, tab, band="G"):
             selb = (tab["band"] == band) & np.isfinite(tab["flux"])
             nout = np.asarray(tab["n_ccd_outlier"][selb])
             row[f"{name}_gaia_outlier_transits"] = int(((nout > 0) & pos & good).sum())
+        # DR3: in-eclipse points the variability pipeline rejected as outliers (kept in our analysis).
+        if "rejected_by_variability" in tab.colnames:
+            selb = (tab["band"] == band) & np.isfinite(tab["flux"])
+            vr = np.asarray(tab["rejected_by_variability"][selb]).astype(bool)
+            row[f"{name}_var_rejected_in_eclipse"] = int((vr & pos & good).sum())
         ins = sec & good
         if ins.any() and np.isfinite(scatter) and scatter > 0:
             depth = 1.0 - np.median(f[ins])
@@ -101,6 +106,12 @@ def atlas_page(ephem, gaia_tab, tess=None, title="", bands=("G", "BP", "RP"), ou
             if rej.any():
                 ax.plot(x[rej], f[rej], "o", mfc="none", mec=st.get("color"), ms=st.get("ms", 4),
                         label=f"{band} rejected ({rej.sum()})" if ax is ax_full else None)
+            if band == "G" and "rejected_by_variability" in gaia_tab.colnames:
+                sel_g = (gaia_tab["band"] == "G") & np.isfinite(gaia_tab["flux"])
+                vr = np.asarray(gaia_tab["rejected_by_variability"][sel_g]).astype(bool)
+                if vr.any():
+                    ax.plot(x[vr], f[vr], "o", mfc="none", mec="k", ms=st.get("ms", 6) + 5, mew=1.0, zorder=6,
+                            label=f"G var.-pipeline outlier ({vr.sum()})" if ax is ax_full else None)
 
     w1 = ephem.primary_width or 0.05
     w2 = ephem.secondary_width or w1
