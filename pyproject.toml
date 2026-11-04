@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ebatlas"
+version = "0.1.0.dev0"
+description = "Gaia DR4 x TESS eclipsing-binary atlas: Gaia epochs folded on TESS ephemerides"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = ["numpy", "astropy>=6", "matplotlib"]
+
+[project.optional-dependencies]
+online = ["astroquery>=0.4.11", "lightkurve>=2.4", "pygaia"]
+dev = ["pytest"]
+
+[project.scripts]
+ebatlas-build = "ebatlas.atlas:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
