@@ -22,7 +22,9 @@
   bit 7 set (`*_gaia_outlier_transits`): a measure of Gaia's pipeline noticing the eclipse.
 - Variability-pipeline epoch flags are a separate product (`EPOCH_FLAGS_VARI`).
 - `epoch_photometry_ccd` (`EPOCH_PHOTOMETRY_CCD`) has per-AF-CCD G fluxes over ~44 s. Not needed for folding.
-- astroquery 0.4.11 already lists the DR4 retrieval types; `data_structure="RAW"` keeps arrays and returns one file.
+- astroquery 0.4.11 already lists the DR4 retrieval types. Since archive release 3.15 (Nov 2026) the data structures
+  are `DATAMODEL_GAIA` (the layout this data model documents; requested first) and `DATAMODEL_STANDARD` (IVOA-style
+  fallback); `INDIVIDUAL` is retired. `ebatlas.datalink` handles the fallback and remembers what worked.
 
 ## Products that matter for this project
 See `src/ebatlas/dr4_tables.py`. Highlights: `epoch_photometry`, `rvs_epoch_parameters_single/double`

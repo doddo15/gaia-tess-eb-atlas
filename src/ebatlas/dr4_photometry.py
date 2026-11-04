@@ -1,7 +1,8 @@
 """Gaia DR4 epoch photometry (DataLink retrieval type EPOCH_PHOTOMETRY).
 
-Written against the DR4 draft data model, section 11.1 (DATAMODEL_GAIA /
-astroquery data_structure="RAW"). Facts from the data model:
+Written against the DR4 draft data model, section 11.1, which documents the
+DATAMODEL_GAIA serialisation (requested first; DATAMODEL_STANDARD is the fallback,
+see datalink.py). Facts from the data model:
 
 * One row per (source_id, transit_id), wide format: g_*, bp_*, rp_* columns.
 * g_obs_time, bp_obs_time, rp_obs_time are **already barycentric**: BJD(TCB)
@@ -22,7 +23,6 @@ row per band per transit) plus: transit_id, fov, n_ccd, n_ccd_outlier, suspect.
 """
 from __future__ import annotations
 
-import time
 import warnings
 from pathlib import Path
 
@@ -32,8 +32,9 @@ from astropy.table import Table, vstack
 from .ephemeris import gaia_time_to_btjd
 from .dr4_astrometry import decode_transit_id, _stack
 
-# TODO(relay): confirm data_release string on release day.
-DR4_DATALINK = {"data_release": "Gaia DR4", "data_structure": "RAW", "retrieval_type": "EPOCH_PHOTOMETRY"}
+# TODO(relay): confirm the data_release string on release day.
+DR4_DATALINK = {"data_release": "Gaia DR4", "retrieval_type": "EPOCH_PHOTOMETRY",
+                "structures": ("DATAMODEL_GAIA", "DATAMODEL_STANDARD")}
 
 PHOT_BITS = {
     "saturation_corrected": 0, "predicted_position_failed": 1, "ac_centring_clamped": 2,
@@ -131,7 +132,7 @@ def read_epoch_photometry(src):
 
 
 def fetch_dr4_epoch_photometry(source_ids, cache_dir="cache/dr4_epoch_photometry", chunk=200,
-                               retries=3, pause=5.0, **datalink):
+                               retries=3, pause=5.0, **datalink_overrides):
     """Fetch DR4 epoch photometry with per-source caching and retries.
 
     Each source is cached as <cache_dir>/<source_id>.ecsv, so a crashed or
@@ -139,9 +140,10 @@ def fetch_dr4_epoch_photometry(source_ids, cache_dir="cache/dr4_epoch_photometry
     nothing for are recorded in <cache_dir>/_empty.txt and not re-requested.
     Returns {source_id: standard table}.
     """
-    from astroquery.gaia import Gaia
+    from . import datalink
+    from .datalink import iter_tables, split_by_source
 
-    params = {**DR4_DATALINK, **datalink}
+    p = {**DR4_DATALINK, **datalink_overrides}
     cache = Path(cache_dir); cache.mkdir(parents=True, exist_ok=True)
     empty_file = cache / "_empty.txt"
     empty = set(int(x) for x in empty_file.read_text().split()) if empty_file.exists() else set()
@@ -150,22 +152,13 @@ def fetch_dr4_epoch_photometry(source_ids, cache_dir="cache/dr4_epoch_photometry
 
     for i in range(0, len(todo), chunk):
         block = todo[i:i + chunk]
-        for attempt in range(retries):
-            try:
-                res = Gaia.load_data(ids=block, format="votable", **params)
-                break
-            except Exception as exc:                       # network / archive hiccups
-                if attempt == retries - 1:
-                    raise
-                warnings.warn(f"DataLink request failed ({exc}); retrying in {pause * (attempt + 1):.0f} s")
-                time.sleep(pause * (attempt + 1))
+        res, _ = datalink.load(block, p["retrieval_type"], p["data_release"], structures=p["structures"],
+                               retries=retries, pause=pause)
         got = set()
-        for tables in res.values():
-            for t in tables:
-                raw = t.to_table() if hasattr(t, "to_table") else t
-                for sid, std in read_epoch_photometry(raw).items():
-                    std.write(cache / f"{sid}.ecsv", overwrite=True)
-                    got.add(sid)
+        for _key, raw in iter_tables(res):
+            for sid, sub in split_by_source(raw).items():
+                standardize_dr4(sub).write(cache / f"{sid}.ecsv", overwrite=True)
+                got.add(sid)
         new_empty = set(block) - got
         if new_empty:
             empty |= new_empty
@@ -173,9 +166,9 @@ def fetch_dr4_epoch_photometry(source_ids, cache_dir="cache/dr4_epoch_photometry
 
     out = {}
     for s in ids:
-        p = cache / f"{s}.ecsv"
-        if p.exists():
-            out[s] = Table.read(p)
+        q = cache / f"{s}.ecsv"
+        if q.exists():
+            out[s] = Table.read(q)
     return out
 
 

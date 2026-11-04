@@ -1,0 +1,11 @@
+numpy
+astropy>=6
+matplotlib
+
+[dev]
+pytest
+
+[online]
+astroquery>=0.4.11
+lightkurve>=2.4
+pygaia

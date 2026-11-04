@@ -1,0 +1,24 @@
+# Conda environment for ebatlas.  From the repository root:
+#   conda env create -f environment.yml
+#   conda activate ebatlas
+#   pytest
+name: ebatlas
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - numpy
+  - scipy
+  - astropy>=6
+  - matplotlib
+  - pandas
+  - polars>=1.0
+  - lightkurve>=2.4
+  - pytest
+  - jupyterlab
+  - ipykernel
+  - pip
+  - pip:
+      - astroquery>=0.4.11   # first version listing the DR4 DataLink retrieval types
+      - pygaia
+      - -e .                 # this repository, editable

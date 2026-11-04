@@ -1,0 +1,2 @@
+[console_scripts]
+ebatlas-build = ebatlas.atlas:main

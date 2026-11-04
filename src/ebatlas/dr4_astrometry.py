@@ -254,20 +254,16 @@ def orbit_grid_fit(obs, periods_days, eccs=(0.0, 0.2, 0.4, 0.6, 0.8), n_t0=24):
     return best
 
 
-def fetch_dr4_epoch_astrometry(source_ids, data_release="Gaia DR4", data_structure="RAW", chunk=500):
-    """DataLink fetch via astroquery. TODO(relay): confirm data_release and
-    data_structure strings on release day (data model: DATAMODEL_STANDARD /
-    DATAMODEL_GAIA; the pre-release sample file was labelled RAW)."""
-    from astroquery.gaia import Gaia
+def fetch_dr4_epoch_astrometry(source_ids, data_release="Gaia DR4", chunk=500,
+                               structures=("DATAMODEL_GAIA", "DATAMODEL_STANDARD")):
+    """DataLink fetch (EPOCH_ASTROMETRY). The reader follows the DATAMODEL_GAIA layout
+    documented in the draft data model. TODO(relay): confirm data_release on release day."""
     from astropy.table import vstack
+    from . import datalink
 
     out = []
     ids = [int(s) for s in source_ids]
     for i in range(0, len(ids), chunk):
-        res = Gaia.load_data(ids=ids[i:i + chunk], data_release=data_release,
-                             retrieval_type="EPOCH_ASTROMETRY", data_structure=data_structure,
-                             format="votable")
-        for tables in res.values():
-            t = tables[0]
-            out.append(t.to_table() if hasattr(t, "to_table") else t)
+        res, _ = datalink.load(ids[i:i + chunk], "EPOCH_ASTROMETRY", data_release, structures=structures)
+        out += [t for _k, t in datalink.iter_tables(res)]
     return vstack(out) if out else Table()

@@ -37,3 +37,12 @@ Short, dated entries: what you did, what's broken, what the next person should d
 - DR3 reader change: `rejected_by_variability` no longer removes points; it is a separate column, ringed on pages and counted.
 - DR3 fetch is now cached per source (cache/dr3_epoch_photometry/).
 - **Next:** run stage 1, then `03_verify_dr3.py --limit 20`; inspect pages before the full run.
+
+## 2026-11-04: first live runs
+- Stage 1 on TEBC: 4564/4574 matched (24 positional, 291 with >1 DR3 candidate); 1966 have DR3 epoch photometry,
+  1454 classified EB by DR3; 2598 matched systems have no DR3 epoch photometry (new in DR4, if published).
+- `03_verify_dr3.py` failed: Gaia archive release 3.15 retired data_structure='INDIVIDUAL'.
+  Fix: new `datalink.py` (DATAMODEL_GAIA then DATAMODEL_STANDARD, remembers the working one, no retries on
+  permanent errors, parses multi-source/multi-table responses); DR3 reader accepts column-name aliases and saves
+  unparseable tables to cache/.../_unparsed/; `scripts/inspect_datalink.py` dumps real responses.
+- **Next:** run `inspect_datalink.py --xmatch data/tebc_dr3_xmatch.ecsv`, then rerun verification with --limit 20.
