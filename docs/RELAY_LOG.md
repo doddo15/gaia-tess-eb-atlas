@@ -78,3 +78,19 @@ Short, dated entries: what you did, what's broken, what the next person should d
   (constrained, depth scale 0.2-5, chi2_red < 20); summary statistics use good fits only.
 - New `templates.py` (shared template code, gridded for speed); layout-fallback warning names the page.
 - **Next:** rerun the same sample (`--sample 50 --seed 1 --min-period 0.25`) and compare.
+
+## 2026-11-05: diagnostics for the Gaia misfit and TESS coverage
+- Post-refit sample: median |Gaia offset| 0.026 -> 0.0045 (refit works), but offset-fit chi2_red barely moved
+  (111 -> 92), worse for fainter targets (rho = +0.41 with Tmag). Refit timings: median chi2_red 50, one
+  catastrophic (TIC441808796, likely cycle slip / primary-secondary confusion), one zero-centred sector.
+- Added `verify.chi2_breakdown` (diag_* columns): in- vs out-of-eclipse chi2, with/without TESS template
+  noise, out-of-eclipse scatter/formal error, G mag and formal per-transit error. Synthetic check: a 10%
+  difference between the Gaia and TESS primary/secondary depth ratios already gives in-eclipse chi2_red ~5.
+- Added `noise.py`: per-transit G noise bounds from DR3 constant stars (phot_g_n_obs counts CCDs, so the
+  per-transit noise is bracketed: upper = mean-flux error * sqrt(n_obs), lower = upper / sqrt(n_obs/transits)).
+- Added `coverage.py` + `scripts/audit_tess_coverage.py`: observed sectors (tess-point, cut at the latest
+  sector with data), products at MAST per pipeline, refit status per sector (new `sector_status.csv`
+  from verification, with reasons: ok / no_eclipse / unconstrained / too_few_points / ...).
+- `scripts/diagnose_errors.py` summarises the chi2 split and (optionally) the noise-curve comparison.
+- **Next:** rerun verification on the same sample, then both diagnostics; decide the error model and the
+  refit hardening from what they show.

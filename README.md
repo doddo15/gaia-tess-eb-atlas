@@ -3,7 +3,7 @@
 A project for the [2026 Gaia Relay](http://gaia.lol) (KITP leg). Contributions from any leg are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md) and the [relay log](docs/RELAY_LOG.md).
 
 ![demo page](verify_dr3_sample/TIC148274098.01.png)
-*An example using the TEBC (Pr\v{s}a et al., 2022) and DR3 epoch data. Top: TESS light curve (grey) folded on its ephemeris, with Gaia G/BP/RP epochs overplotted. Middle: zoom on each eclipse; open circles mark points rejected by the Gaia pipeline. Bottom: Gaia G epochs vs time, colored by phase.
+*An example using the TEBC (Prša et al., 2022) and DR3 epoch data. Top: TESS light curve (grey) folded on its ephemeris, with Gaia G/BP/RP epochs overplotted. Middle: zoom on each eclipse; open circles mark points rejected by the Gaia pipeline. Bottom: Gaia G epochs vs time, colored by phase.
 
 ## Why
 

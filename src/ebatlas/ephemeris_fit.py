@@ -45,12 +45,15 @@ def sector_timing(ephem, template, t, f, exptime_s, span, n=401, min_dchi2=25.0)
 
     Coarse scan over +-span, then a fine scan around the minimum (step ~2e-5 phase).
     """
-    out = {"ok": False, "delta": np.nan, "err": np.nan, "n_points": int(len(t)), "n_in_eclipse": 0}
+    out = {"ok": False, "delta": np.nan, "err": np.nan, "n_points": int(len(t)), "n_in_eclipse": 0,
+           "status": "too_few_points"}
     if len(t) < 20:
         return out
     sig = _noise(f)
     if not np.isfinite(sig) or sig <= 0:
+        out["status"] = "bad_noise"
         return out
+    out["status"] = "unconstrained"
     e = np.full(len(t), sig)
     tm = smeared(template, float(exptime_s) / 86400.0 / ephem.period)
     ph = ephem.phase(t)
@@ -88,9 +91,10 @@ def sector_timing(ephem, template, t, f, exptime_s, span, n=401, min_dchi2=25.0)
     best = shifts[k] + (0.5 * step * (c0 - c2) / den if den > 0 else 0.0)
     grid = np.linspace(-0.5, 0.5, 4001); tg = tm(grid); base = np.median(tg); depth = (base - tg).max()
     n_in = int(np.sum((base - tm(ph - best)) > 0.2 * depth)) if depth > 0 else 0
+    ok = bool(out["dchi2_coarse"] > min_dchi2 and n_in >= 3 and scale[k] > 0)
+    status = "ok" if ok else ("no_eclipse" if n_in < 3 else ("negative_scale" if scale[k] <= 0 else "unconstrained"))
     out.update(delta=float(best), err=float(max(0.25 * (shifts[hi] - shifts[lo]), step / 2)),
-               n_in_eclipse=n_in, scale=float(scale[k]), chi2_red=float(chi2[k] / dof),
-               ok=bool(out["dchi2_coarse"] > min_dchi2 and n_in >= 3 and scale[k] > 0))
+               n_in_eclipse=n_in, scale=float(scale[k]), chi2_red=float(chi2[k] / dof), ok=ok, status=status)
     return out
 
 
@@ -142,7 +146,7 @@ def refit_ephemeris(catalog_ephem, lc, n_iter=2, max_span=0.25):
     authors = np.asarray(lc.author)[ok]
     sectors = np.unique(sec)
     tmid = {s: float(np.median(t[sec == s])) for s in sectors}
-    result = {"status": "no_timings", "ephem": catalog_ephem, "timings": Table(), "n_sectors": 0,
+    result = {"status": "no_timings", "ephem": catalog_ephem, "timings": Table(), "sector_status": Table(), "n_sectors": 0,
               "baseline_days": 0.0, "chi2_red": np.nan, "quad_snr": np.nan, "period_shift_sigma": np.nan,
               "template_exptime": float(np.nanmin(exp)) if exp.size else np.nan}
     if len(sectors) == 0:
@@ -157,14 +161,18 @@ def refit_ephemeris(catalog_ephem, lc, n_iter=2, max_span=0.25):
 
     order = sorted(sectors, key=lambda s: abs(tmid[s] - catalog_ephem.t0))
     timings = {}
+    status = {}
     for it in range(n_iter + 1):
         timings = {}
+        status = {}
         for s in order:
             mm = sec == s
             sig = float(eph.phase_sigma(tmid[s]))
             span = float(np.clip(5 * sig, 0.01, max_span)) if it == 0 else float(np.clip(5 * sig, 0.005, 0.05))
             extra = max(float(np.median(exp[mm])) - tmpl_exp, 0.0)        # smear only beyond the template's own
             r = sector_timing(eph, template, t[mm], f[mm], extra, span)
+            status[s] = {"sector": int(s), "author": str(authors[mm][0]), "exptime": float(np.median(exp[mm])),
+                         "n_points": int(mm.sum()), "status": r["status"], "n_in_eclipse": r["n_in_eclipse"]}
             if not r["ok"]:
                 continue
             E = int(np.round((tmid[s] - eph.t0) / eph.period))
@@ -188,6 +196,7 @@ def refit_ephemeris(catalog_ephem, lc, n_iter=2, max_span=0.25):
             template = tess_template(eph, t[sc], f[sc], phase_shift=shift)
             tmpl_exp = float(np.nanmin(exp[sc]))
 
+    result["sector_status"] = Table(rows=[status[s] for s in sorted(status)]) if status else Table()
     if len(timings) == 0:
         return result
     ts = list(timings.values())

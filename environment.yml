@@ -21,4 +21,5 @@ dependencies:
   - pip:
       - astroquery>=0.4.11   # first version listing the DR4 DataLink retrieval types
       - pygaia
+      - tess-point           # which sectors a star fell on (coverage audit)
       - -e .                 # this repository, editable

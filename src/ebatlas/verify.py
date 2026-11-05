@@ -125,7 +125,9 @@ def _analyse(base, lc, tab, n_boot, template=None):
                     secondary_phase=pick("secondary_phase", base.secondary_phase),
                     secondary_width=pick("secondary_width", base.secondary_width))
     tmpl = template if template is not None else tess_template(eph, t, f)
-    off = phase_offset_scan(eph, tab, tmpl, boot_templates=bootstrap_templates(eph, t, f, n=n_boot))
+    boots = bootstrap_templates(eph, t, f, n=n_boot)
+    off = phase_offset_scan(eph, tab, tmpl, boot_templates=boots)
+    off["_diag"] = chi2_breakdown(eph, tab, tmpl, off.get("best_shift", np.nan), boots)
     return eph, geom, off
 
 
@@ -148,6 +150,62 @@ def fit_ok(off, max_chi2_red=20.0, scale_range=(0.2, 5.0)):
     """Offset fits worth trusting: constrained, sensible depth scale, template matches the Gaia points."""
     return bool(off.get("constrained") and scale_range[0] < off.get("depth_scale", np.nan) < scale_range[1]
                 and off.get("chi2_red", np.inf) < max_chi2_red)
+
+
+def chi2_breakdown(ephem, gaia_tab, template, shift, boot_templates=None, band="G", in_frac=0.2):
+    """Where does the offset fit's chi^2 come from?
+
+    Returns, for the best-fit shift: n_in / n_oot (Gaia points in / out of eclipse, using
+    the template's own dip > in_frac of its depth), chi2_red_in / chi2_red_oot,
+    oot_scatter_ratio (robust std of normalised out-of-eclipse residuals: 1 means Gaia's
+    formal errors describe the scatter), the same chi2's with the TESS template's noise
+    (spread of bootstrap templates at each Gaia phase) added to the errors, the median
+    template-noise / Gaia-error ratio in eclipse, and the source's median G and formal
+    relative per-transit error.
+
+    Reading it: excess mostly out of eclipse -> noise (Gaia errors, crowding); excess
+    mostly in eclipse and not removed by template noise -> model mismatch (bandpass,
+    changes between the Gaia and TESS eras).
+    """
+    from .plotting import MAX_NORM_FLUX
+    sel = (np.asarray(gaia_tab["band"]) == band) & ~np.asarray(gaia_tab["rejected"]).astype(bool)
+    f = np.asarray(gaia_tab["flux"], float)[sel]; e = np.asarray(gaia_tab["flux_err"], float)[sel]
+    t = np.asarray(gaia_tab["btjd"], float)[sel]
+    mag = np.asarray(gaia_tab["mag"], float)[sel] if "mag" in gaia_tab.colnames else np.full(sel.sum(), np.nan)
+    ok = np.isfinite(f) & np.isfinite(e) & (e > 0) & np.isfinite(t)
+    t, f, e, mag = t[ok], f[ok], e[ok], mag[ok]
+    out = {"n_in": 0, "n_oot": 0, "chi2_red_in": np.nan, "chi2_red_oot": np.nan, "oot_scatter_ratio": np.nan,
+           "chi2_red_in_tnoise": np.nan, "chi2_red_oot_tnoise": np.nan, "tnoise_over_err_in": np.nan,
+           "g_mag": float(np.nanmedian(mag)) if mag.size else np.nan, "rel_err_formal": np.nan}
+    if len(t) < 10 or not np.isfinite(shift):
+        return out
+    med = np.median(f); f, e = f / med, e / med
+    keep = f < MAX_NORM_FLUX
+    t, f, e = t[keep], f[keep], e[keep]
+    out["rel_err_formal"] = float(np.median(e))
+    ph = ephem.phase(t)
+    m = template(ph - shift) - 1.0
+    A = np.column_stack([np.ones_like(m), m])
+    p, *_ = np.linalg.lstsq(A / e[:, None], f / e, rcond=None)
+    model = A @ p
+    grid = np.linspace(-0.5, 0.5, 4001); tg = template(grid); base = np.median(tg); depth = (base - tg).max()
+    inn = (base - template(ph - shift)) > in_frac * depth if depth > 0 else np.zeros(len(t), bool)
+    oot = ~inn
+
+    def red(err, mask, dof_loss):
+        n = mask.sum()
+        return float(np.sum(((f - model) / err)[mask] ** 2) / max(n - dof_loss, 1)) if n else np.nan
+
+    out.update(n_in=int(inn.sum()), n_oot=int(oot.sum()), chi2_red_in=red(e, inn, 0), chi2_red_oot=red(e, oot, 2))
+    if oot.sum() >= 5:
+        r = ((f - model) / e)[oot]
+        out["oot_scatter_ratio"] = float(1.4826 * np.median(np.abs(r - np.median(r))))
+    if boot_templates:
+        tv = np.std([bt(ph - shift) for bt in boot_templates], axis=0) * abs(p[1])
+        e2 = np.hypot(e, tv)
+        out.update(chi2_red_in_tnoise=red(e2, inn, 0), chi2_red_oot_tnoise=red(e2, oot, 2),
+                   tnoise_over_err_in=float(np.median(tv[inn] / e[inn])) if inn.any() else np.nan)
+    return out
 
 
 def _truthy(v):
@@ -183,7 +241,7 @@ def verify_dr3(cat, xmatch, out_dir, fetcher=None, lc_getter=None, cache_dir="ca
         keep = keep[:limit]
     epochs = fetcher(sorted({int(r["dr3_source_id"]) for r in keep}))
 
-    rows, lc_cache = [], {}
+    rows, lc_cache, sector_rows = [], {}, []
     for x in keep:
         row = by_eb[x["eb_id"]]; sid = int(x["dr3_source_id"]); tic = int(row["tic_id"])
         rec = {"eb_id": x["eb_id"], "tic_id": tic, "gaia_dr3_id": sid, "period": float(row["period"]),
@@ -222,17 +280,20 @@ def verify_dr3(cat, xmatch, out_dir, fetcher=None, lc_getter=None, cache_dir="ca
             better = (alt[2].get("constrained") and np.isfinite(alt[2].get("chi2_red", np.nan))
                       and alt[2]["chi2_red"] < 0.9 * off.get("chi2_red", np.inf))
             other = (eph, geom, off, fit, cat) if better else alt
-            rec.update({f"alt_offset_{k}": v for k, v in other[2].items()})
+            rec.update({f"alt_offset_{k}": v for k, v in other[2].items() if not k.startswith("_")})
             rec["alt_period_factor"] = 1 if better else 2
             if better:
                 eph, geom, off, fit, cat = alt
                 rec["adopted_period_factor"] = 2
         if fit is not None:
             rec.update(_refit_columns(fit, cat, g_btjd))
+            for srow in fit.get("sector_status", []):
+                sector_rows.append({"eb_id": x["eb_id"], "tic_id": tic, **{k: srow[k] for k in srow.colnames}})
         if geom is not None:
             rec.update({f"meas_{k}": geom[k] for k in ("primary_width", "primary_depth", "secondary_phase",
                                                       "secondary_width", "contact_like")})
         rec.update(summarize(eph, epochs[sid]))
+        rec.update({f"diag_{k}": v for k, v in off.pop("_diag", {}).items()})
         rec.update({f"offset_{k}": v for k, v in off.items()})
         rec["offset_fit_ok"] = fit_ok(off) if off else False
         if pages:
@@ -252,6 +313,8 @@ def verify_dr3(cat, xmatch, out_dir, fetcher=None, lc_getter=None, cache_dir="ca
     from .atlas import _rows_to_table
     res = _rows_to_table(rows) if rows else Table()
     res.write(out_dir / "verification.csv", overwrite=True)
+    if sector_rows:
+        _rows_to_table(sector_rows).write(out_dir / "sector_status.csv", overwrite=True)
     if len(res):
         verification_figure(res, out_dir / "verification_summary.png")
     return res
