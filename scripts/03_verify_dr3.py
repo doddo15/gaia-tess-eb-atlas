@@ -25,6 +25,7 @@ ap.add_argument("--no-pages", action="store_true"); ap.add_argument("--cache", d
 ap.add_argument("--sample", type=int, default=None, help="random subset of this size (after period cuts)")
 ap.add_argument("--seed", type=int, default=0)
 ap.add_argument("--min-period", type=float, default=None); ap.add_argument("--max-period", type=float, default=None)
+ap.add_argument("--no-refit", action="store_true", help="use catalog ephemerides as published")
 a = ap.parse_args()
 
 cat = load_catalog(a.catalog, "tebc")
@@ -39,19 +40,33 @@ has = np.array([str(v).strip().lower() in ("true", "1") for v in xm["dr3_has_epo
 xm = xm[has & (xm["dr3_source_id"] > 0)]
 if a.sample and a.sample < len(xm):
     xm = xm[np.sort(np.random.default_rng(a.seed).choice(len(xm), a.sample, replace=False))]
-res = verify_dr3(cat, xm, a.out, cache_dir=a.cache, pages=not a.no_pages, limit=a.limit)
+res = verify_dr3(cat, xm, a.out, cache_dir=a.cache, pages=not a.no_pages, limit=a.limit, refit=not a.no_refit)
 
 n = len(res)
 print(f"{n} TEBC systems with DR3 epoch photometry checked")
 if n:
     print(f"  with TESS light curve: {np.sum(res['has_tess'])}")
+    if "refit_status" in res.colnames:
+        st = {str(k): int(v) for k, v in zip(*np.unique(np.asarray(res["refit_status"]).astype(str), return_counts=True)) if k}
+        print(f"  ephemeris refit: {st}")
+        ok_r = np.asarray(res["refit_status"]).astype(str) == "ok"
+        if ok_r.any():
+            print(f"    median sectors {np.median(np.asarray(res['refit_n_sectors'])[ok_r]):.0f}, "
+                  f"median baseline {np.median(np.asarray(res['refit_baseline_days'])[ok_r]) / 365.25:.1f} yr; "
+                  f"catalog period off by >3σ: {np.sum(np.abs(np.asarray(res['refit_period_shift_sigma'], float)[ok_r]) > 3)}; "
+                  f"period change (|quad|>5σ): {np.sum(np.abs(np.asarray(res['refit_quad_snr'], float)[ok_r]) > 5)}")
+            dr = np.abs(np.asarray(res["catalog_drift_at_gaia"], float)[ok_r])
+            print(f"    catalog vs refit at Gaia epochs: median |Δphase| {np.nanmedian(dr):.4f}, >0.01 for {np.sum(dr > 0.01)}")
     if "offset_constrained" in res.colnames:
         con = np.asarray(res["offset_constrained"]).astype(bool)
-        z = np.asarray(res["offset_z"], float)[con]
-        print(f"  phase offset constrained: {con.sum()};  |z| < 3: {np.mean(np.abs(z) < 3):.0%}" if con.any() else "  no constrained offsets")
+        good = np.asarray(res["offset_fit_ok"]).astype(bool) if "offset_fit_ok" in res.colnames else con
+        print(f"  phase offset constrained: {con.sum()}; good fits (χ²_red<20, sane depth scale): {good.sum()}")
         if con.any():
-            big = res[con][np.abs(z) >= 3]
-            for r in big:
+            print(f"    median χ²_red of constrained fits: {np.nanmedian(np.asarray(res['offset_chi2_red'], float)[con]):.1f}")
+        if good.any():
+            z = np.asarray(res["offset_z"], float)[good]
+            print(f"    good fits with |z| < 3: {np.mean(np.abs(z) < 3):.0%}")
+            for r in res[good][np.abs(z) >= 3]:
                 print(f"    |z|>=3: {r['eb_id']}  offset {r['offset_best_shift']:+.4f} ± {r['offset_shift_err']:.4f}  "
                       f"(ephemeris σ {r['offset_sigma_phase_gaia']:.4f}, P = {r['period']:.5f} d)")
     pc = {str(k): int(v) for k, v in zip(*np.unique(np.asarray(res["period_check"]), return_counts=True))}

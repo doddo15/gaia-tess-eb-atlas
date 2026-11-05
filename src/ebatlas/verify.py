@@ -23,7 +23,11 @@ import numpy as np
 from astropy.table import Table
 
 from .ephemeris import _wrap
-from .eclipses import _bin, measure_eclipses
+from .eclipses import measure_eclipses
+from .templates import tess_template, bootstrap_templates, smeared, _scan, _running_mean  # noqa: F401 (re-exported)
+from .ephemeris import Ephemeris
+from .ephemeris_fit import refit_ephemeris, oc_figure
+from .tess import as_tesslc
 
 
 def period_agreement(period, dr3_frequency, rtol=2e-3):
@@ -39,93 +43,6 @@ def period_agreement(period, dr3_frequency, rtol=2e-3):
         if abs(r / k - 1.0) < rtol:
             return r, name
     return r, "mismatch"
-
-
-def _running_mean(x, k):
-    c = np.cumsum(np.r_[0.0, x])
-    return (c[k:] - c[:-k]) / k
-
-
-def tess_template(ephem, t, flux, nbins=None, n_harm=8, window=0.75, k=5):
-    """Periodic model of the folded TESS light curve.
-
-    Outside the eclipse windows (|phase - centre| < window * width): a Fourier series
-    (n_harm harmonics) fitted to the binned curve, carrying ellipsoidal/reflection
-    variation without bin noise. Inside the windows: a running mean over k
-    phase-sorted TESS points (of both phase and residual), which keeps the data's own
-    phase resolution; fixed bins would smear sharp contact points and bias offsets.
-    Without eclipse widths on `ephem` it falls back to the plain binned curve.
-    """
-    t = np.asarray(t, float); f = np.asarray(flux, float)
-    ok = np.isfinite(t) & np.isfinite(f)
-    t, f = t[ok], f[ok] / np.nanmedian(f[ok])
-    if nbins is None:
-        nbins = int(np.clip(len(t) // 20, 200, 4000))
-    ph_all = ephem.phase(t)
-    c, b, _ = _bin(ph_all, f, nbins)
-
-    def in_win(x):
-        m = np.zeros(np.shape(x), bool)
-        if ephem.primary_width:
-            m |= np.abs(_wrap(x)) < window * ephem.primary_width
-        if ephem.secondary_width:
-            m |= np.abs(_wrap(x - ephem.secondary_phase)) < window * ephem.secondary_width
-        return m
-
-    win_b = in_win(c)
-    if not win_b.any() or (~win_b).sum() < 2 * n_harm + 5:
-        cc, bb = np.r_[c - 1, c, c + 1], np.r_[b, b, b]
-        return lambda ph: np.interp(_wrap(ph), cc, bb)
-
-    def design(x):
-        x = np.atleast_1d(x)
-        cols = [np.ones_like(x)]
-        for j in range(1, n_harm + 1):
-            cols += [np.cos(2 * np.pi * j * x), np.sin(2 * np.pi * j * x)]
-        return np.column_stack(cols)
-
-    coef, *_ = np.linalg.lstsq(design(c[~win_b]), b[~win_b], rcond=None)
-    w = in_win(ph_all)
-    if w.sum() < 2 * k:
-        return lambda ph: design(_wrap(ph)) @ coef
-    pw = ph_all[w]; rw = f[w] - design(pw) @ coef
-    o = np.argsort(pw); pw, rw = pw[o], rw[o]
-    xs, ys = _running_mean(pw, k), _running_mean(rw, k)
-    # zero residual just outside each window edge so the template is continuous
-    edges = []
-    for cen, wd in ((0.0, ephem.primary_width), (ephem.secondary_phase, ephem.secondary_width)):
-        if wd:
-            edges += [_wrap(cen - window * wd), _wrap(cen + window * wd)]
-    xs = np.r_[xs, edges]; ys = np.r_[ys, np.zeros(len(edges))]
-    o = np.argsort(xs); xs, ys = xs[o], ys[o]
-    cc, rr = np.r_[xs - 1, xs, xs + 1], np.r_[ys, ys, ys]
-    outside = lambda ph: ~in_win(ph)
-    return lambda ph: design(_wrap(ph)) @ coef + np.where(outside(_wrap(ph)), 0.0, np.interp(_wrap(ph), cc, rr))
-
-
-def bootstrap_templates(ephem, t, flux, n=10, seed=0, **kw):
-    """Templates from TESS light curves resampled with replacement (for template-noise errors)."""
-    rng = np.random.default_rng(seed)
-    t = np.asarray(t, float); f = np.asarray(flux, float)
-    out = []
-    for _ in range(n):
-        i = np.sort(rng.integers(0, len(t), len(t)))
-        out.append(tess_template(ephem, t[i], f[i], **kw))
-    return out
-
-
-def _scan(ph, f, e, template, shifts):
-    """Vectorised weighted fit of flux = a + b*(template(ph - s) - 1) for every shift s."""
-    M = np.stack([template(ph - s) - 1.0 for s in shifts])            # (n_shift, n_pts)
-    w = 1.0 / e**2
-    S, Sx, Sy = w.sum(), M @ w, (w * f).sum()
-    Sxx, Sxy = (M**2) @ w, M @ (w * f)
-    det = S * Sxx - Sx**2
-    det = np.where(np.abs(det) < 1e-300, np.nan, det)
-    b = (S * Sxy - Sx * Sy) / det
-    a = (Sy - b * Sx) / S
-    chi2 = (((f[None, :] - a[:, None] - b[:, None] * M) ** 2) * w[None, :]).sum(axis=1)
-    return np.nan_to_num(chi2, nan=np.inf), b
 
 
 def phase_offset_scan(ephem, gaia_tab, template, band="G", span=None, n=801, min_dchi2=25.0,
@@ -190,25 +107,47 @@ def phase_offset_scan(ephem, gaia_tab, template, band="G", span=None, n=801, min
     return out
 
 
-def _analyse(row, factor, lc, tab, n_boot):
-    """Ephemeris (catalog period x factor), eclipse geometry from TESS, and offset scan."""
-    from .catalogs import row_to_ephemeris
+def _analyse(base, lc, tab, n_boot, template=None):
+    """Eclipse geometry, template and Gaia offset scan on the given base ephemeris."""
     from .ephemeris import Ephemeris
+    from .templates import shortest_cadence_mask
+    from .tess import as_tesslc
 
-    base = row_to_ephemeris(row)
-    if factor != 1:
-        base = Ephemeris(base.period * factor, base.t0, base.period_err * factor, base.t0_err)
     if lc is None:
         return base, None, {}
-    geom = measure_eclipses(base, lc[0], lc[1])
+    lc = as_tesslc(lc)
+    sc = shortest_cadence_mask(lc.exptime)
+    t, f = np.asarray(lc.t)[sc], np.asarray(lc.flux)[sc]
+    geom = measure_eclipses(base, t, f)
     pick = lambda k, d: geom[k] if np.isfinite(geom[k]) else d
     eph = Ephemeris(base.period, base.t0, base.period_err, base.t0_err,
                     primary_width=pick("primary_width", base.primary_width),
                     secondary_phase=pick("secondary_phase", base.secondary_phase),
                     secondary_width=pick("secondary_width", base.secondary_width))
-    off = phase_offset_scan(eph, tab, tess_template(eph, lc[0], lc[1]),
-                            boot_templates=bootstrap_templates(eph, lc[0], lc[1], n=n_boot))
+    tmpl = template if template is not None else tess_template(eph, t, f)
+    off = phase_offset_scan(eph, tab, tmpl, boot_templates=bootstrap_templates(eph, t, f, n=n_boot))
     return eph, geom, off
+
+
+def _refit_columns(fit, cat_eph, gaia_btjd):
+    e = fit["ephem"]
+    rec = {"refit_status": fit["status"], "refit_n_sectors": fit["n_sectors"],
+           "refit_baseline_days": fit["baseline_days"], "refit_chi2_red": fit["chi2_red"],
+           "refit_quad_snr": fit["quad_snr"], "refit_period_shift_sigma": fit["period_shift_sigma"],
+           "template_exptime_s": fit["template_exptime"]}
+    if fit["status"] == "ok":
+        rec.update(refit_period=e.period, refit_period_err=e.period_err, refit_t0=e.t0, refit_t0_err=e.t0_err)
+        if gaia_btjd is not None and len(gaia_btjd):
+            tg = float(np.median(gaia_btjd))
+            # how far apart the catalog and refit ephemerides put the eclipses at the Gaia epochs
+            rec["catalog_drift_at_gaia"] = float(_wrap(cat_eph.phase(tg) - e.phase(tg)))
+    return rec
+
+
+def fit_ok(off, max_chi2_red=20.0, scale_range=(0.2, 5.0)):
+    """Offset fits worth trusting: constrained, sensible depth scale, template matches the Gaia points."""
+    return bool(off.get("constrained") and scale_range[0] < off.get("depth_scale", np.nan) < scale_range[1]
+                and off.get("chi2_red", np.inf) < max_chi2_red)
 
 
 def _truthy(v):
@@ -216,8 +155,11 @@ def _truthy(v):
 
 
 def verify_dr3(cat, xmatch, out_dir, fetcher=None, lc_getter=None, cache_dir="cache/dr3_epoch_photometry",
-               pages=True, limit=None, n_boot=10):
+               pages=True, limit=None, n_boot=10, refit=True):
     """Run the three checks for every catalog EB that has DR3 epoch photometry.
+
+    With refit=True (default) each ephemeris is first refit from all TESS sectors
+    (ephemeris_fit.refit_ephemeris); the Gaia comparison then uses the refit ephemeris.
 
     cat: unified catalog; xmatch: stage-1 table (needs eb_id, dr3_source_id,
     dr3_has_epoch_photometry, dr3_eb_frequency). fetcher(ids) -> {sid: table}
@@ -252,34 +194,59 @@ def verify_dr3(cat, xmatch, out_dir, fetcher=None, lc_getter=None, cache_dir="ca
             rows.append(rec); continue
         if tic not in lc_cache:
             try:
-                lc_cache[tic] = lc_getter(tic)
+                lc_cache[tic] = as_tesslc(lc_getter(tic))
             except Exception:
                 lc_cache[tic] = None
         lc = lc_cache[tic]
         rec["has_tess"] = lc is not None
+        if lc is not None:
+            rec["tess_sectors"] = int(len(np.unique(lc.sector)))
+            rec["tess_authors"] = ",".join(sorted(set(map(str, lc.author))))
+        g_btjd = np.asarray(epochs[sid]["btjd"][np.asarray(epochs[sid]["band"]) == "G"], float)
 
-        eph, geom, off = _analyse(row, 1, lc, epochs[sid], n_boot)
+        def attempt(factor):
+            cat = row_to_ephemeris(row)
+            if factor != 1:
+                cat = Ephemeris(cat.period * factor, cat.t0, cat.period_err * factor, cat.t0_err)
+            fit = refit_ephemeris(cat, lc) if (refit and lc is not None) else None
+            base = fit["ephem"] if fit is not None and fit["status"] == "ok" else cat
+            tmpl = fit.get("template") if fit is not None and fit["status"] == "ok" else None
+            eph, geom, off = _analyse(base, lc, epochs[sid], n_boot, template=tmpl)
+            return eph, geom, off, fit, cat
+
+        eph, geom, off, fit, cat = attempt(1)
         # DR3 says the period is twice the catalog's: a common catalog alias for contact
         # binaries with near-equal eclipses. Try 2P and adopt it if it fits clearly better.
         if pclass == "double" and lc is not None:
-            eph2, geom2, off2 = _analyse(row, 2, lc, epochs[sid], n_boot)
-            better = (off2.get("constrained") and np.isfinite(off2.get("chi2_red", np.nan))
-                      and off2["chi2_red"] < 0.9 * off.get("chi2_red", np.inf))
-            alt = (eph, geom, off) if better else (eph2, geom2, off2)
-            rec.update({f"alt_offset_{k}": v for k, v in alt[2].items()})
+            alt = attempt(2)
+            better = (alt[2].get("constrained") and np.isfinite(alt[2].get("chi2_red", np.nan))
+                      and alt[2]["chi2_red"] < 0.9 * off.get("chi2_red", np.inf))
+            other = (eph, geom, off, fit, cat) if better else alt
+            rec.update({f"alt_offset_{k}": v for k, v in other[2].items()})
             rec["alt_period_factor"] = 1 if better else 2
             if better:
-                eph, geom, off = eph2, geom2, off2
+                eph, geom, off, fit, cat = alt
                 rec["adopted_period_factor"] = 2
+        if fit is not None:
+            rec.update(_refit_columns(fit, cat, g_btjd))
         if geom is not None:
             rec.update({f"meas_{k}": geom[k] for k in ("primary_width", "primary_depth", "secondary_phase",
                                                       "secondary_width", "contact_like")})
         rec.update(summarize(eph, epochs[sid]))
         rec.update({f"offset_{k}": v for k, v in off.items()})
+        rec["offset_fit_ok"] = fit_ok(off) if off else False
         if pages:
             tag = "  (2× catalog P)" if rec["adopted_period_factor"] == 2 else ""
+            tag += "  [refit]" if fit is not None and fit["status"] == "ok" else ""
             atlas_page(eph, epochs[sid], tess=lc, title=f"{x['eb_id']} / Gaia DR3 {sid}{tag}",
                        out=out_dir / f"{x['eb_id']}.png")
+            if fit is not None and len(fit["timings"]):
+                gp = None
+                if off and off.get("constrained") and len(g_btjd):
+                    from astropy.time import Time
+                    gy = float(Time(np.median(g_btjd) + 2457000.0, format="jd", scale="tdb").decimalyear)
+                    gp = (gy, off["best_shift"] * eph.period * 1440.0, off["shift_err"] * eph.period * 1440.0)
+                oc_figure(fit, out_dir / f"{x['eb_id']}_oc.png", title=x["eb_id"], gaia_point=gp)
         rows.append(rec)
 
     from .atlas import _rows_to_table
@@ -295,8 +262,8 @@ def verification_figure(res, path):
     import matplotlib.pyplot as plt
 
     fig, ax = plt.subplots(1, 3, figsize=(15, 4.3), constrained_layout=True)
-    con = (np.asarray(res["offset_constrained"]).astype(bool) if "offset_constrained" in res.colnames
-           else np.zeros(len(res), bool))
+    col = "offset_fit_ok" if "offset_fit_ok" in res.colnames else "offset_constrained"
+    con = np.asarray(res[col]).astype(bool) if col in res.colnames else np.zeros(len(res), bool)
     if con.any():
         z = np.asarray(res["offset_z"], float)[con]
         ax[0].hist(np.clip(z, -8, 8), bins=np.linspace(-8, 8, 33), color="#1f5fbf", alpha=0.8)
@@ -311,7 +278,7 @@ def verification_figure(res, path):
             ax[1].plot(lim, [k * v for v in lim], color="0.4", ls=ls, lw=0.8, label=f"{k}σ")
         ax[1].legend(fontsize=8)
     ax[0].set_xlabel("Phase offset / combined error (z)"); ax[0].set_ylabel("N targets")
-    ax[0].set_title(f"Phase-offset check: {con.sum()} constrained of {len(res)}", fontsize=10)
+    ax[0].set_title(f"Phase-offset check: {con.sum()} good fits of {len(res)}", fontsize=10)
     ax[1].set_xlabel(r"Propagated ephemeris error $\sigma_\phi$ at Gaia epochs")
     ax[1].set_ylabel("|best phase offset|"); ax[1].set_title("Offsets vs. expected drift", fontsize=10)
     r = np.asarray(res["dr3_period_ratio"], float); r = r[np.isfinite(r)]

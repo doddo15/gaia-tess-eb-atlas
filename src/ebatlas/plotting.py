@@ -201,6 +201,18 @@ def atlas_page(ephem, gaia_tab, tess=None, title="", bands=("G", "BP", "RP"), ou
         ax_t.set_xlabel("Year"); ax_t.set_ylabel("Gaia G (norm.)")
 
     if out:
-        fig.savefig(out, dpi=130)
+        _save(fig, out, title)
         plt.close(fig)
     return fig
+
+
+def _save(fig, out, title=""):
+    """Save; if constrained_layout gives up (axes collapse), retry without it and say which page."""
+    import warnings
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        fig.savefig(out, dpi=130)
+    if any("constrained_layout not applied" in str(w.message) for w in caught):
+        fig.set_layout_engine(None)
+        fig.savefig(out, dpi=130, bbox_inches="tight")
+        warnings.warn(f"layout fallback used for page: {title or out}")

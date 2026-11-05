@@ -61,3 +61,20 @@ Short, dated entries: what you did, what's broken, what the next person should d
   (8) `03_verify_dr3.py --sample/--seed/--min-period/--max-period`.
 - **Next:** rerun with `--sample 50 --seed 1 --min-period 0.25` for a representative check; refine ephemerides
   from all TESS sectors (multiple tracks in folded TESS = period error across sectors).
+
+## 2026-11-04: random-sample verification (50, P > 0.25 d) and ephemeris refits
+- Sample result: 31/49 offsets constrained, but median chi2_red of the offset fits was 107 and the TESS-template
+  bootstrap dominated every error: the multi-year TESS fold was smeared by the catalog (PM) period, so the
+  |z|>=3 list from that run is not evidence of period changes yet. 10 period "mismatches" were mostly long-period
+  detached systems with odd ratios (DR3 aliases, not our problem).
+- `tess.fetch_tess_lc` now uses SPOC, TESS-SPOC and QLP, one product per sector (SPOC 120 s > SPOC 20 s >
+  TESS-SPOC > QLP), returning a `TessLC` with sector, exposure time and pipeline per point.
+- New `ephemeris_fit.refit_ephemeris`: per-sector timings (template smeared to each sector's exposure),
+  progressive fitting outward from the catalog epoch, shift-and-stack templates, 5 s timing floor, chi2
+  inflation, quadratic (period-change) test. On synthetics: constant P recovered to <0.5 s per sector;
+  a 2e-9 d/cycle period change detected at ~190 sigma (stacking on a linear fold had biased timings by ~100 s).
+- Verification refits by default (`--no-refit` to skip), records refit_* columns and catalog_drift_at_gaia,
+  writes <eb_id>_oc.png (TESS sector O-C + the Gaia-era point), and flags offset_fit_ok
+  (constrained, depth scale 0.2-5, chi2_red < 20); summary statistics use good fits only.
+- New `templates.py` (shared template code, gridded for speed); layout-fallback warning names the page.
+- **Next:** rerun the same sample (`--sample 50 --seed 1 --min-period 0.25`) and compare.

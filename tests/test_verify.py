@@ -81,3 +81,28 @@ def test_verify_dr3_offline(tmp_path):
     assert np.all(np.abs(res["meas_secondary_phase"] - 0.5) < 0.01)
     assert res["primary_var_rejected_in_eclipse"][0] >= 1           # flagged, but kept
     assert (tmp_path / "verification.csv").exists() and (tmp_path / "verification_summary.png").exists()
+
+
+def test_verify_with_refit(tmp_path):
+    """Catalog period slightly wrong; TESS spans 6 years. Refit should remove the Gaia-era drift."""
+    import importlib.util, pathlib
+    spec = importlib.util.spec_from_file_location("tf", pathlib.Path(__file__).parent / "test_ephemeris_fit.py")
+    tf = importlib.util.module_from_spec(spec); spec.loader.exec_module(tf)
+    from astropy.table import Table as T
+    P, T0 = 1.7, 1330.0
+    true = Ephemeris(P, T0, primary_width=0.05, secondary_phase=0.5, secondary_width=0.05)
+    exps = {1: 1800.0, 27: 600.0, 54: 200.0, 80: 200.0}
+    lc = tf._lc(true, list(exps), exps, seed=3)
+    rng = np.random.default_rng(4)
+    gb = np.sort(rng.uniform(-130, 1100, 300))
+    gaia = standardize_dr3(_dr3_long(true, gb, sid=1))
+    cat = T({"eb_id": ["TIC1.01"], "tic_id": [1], "period": [P + 2e-5], "t0_btjd": [T0], "period_err": [2e-6],
+             "t0_err": [2e-4], "primary_width": [np.nan], "secondary_phase": [np.nan], "secondary_width": [np.nan]})
+    xm = T({"eb_id": ["TIC1.01"], "dr3_source_id": [1], "dr3_has_epoch_photometry": [True], "dr3_eb_frequency": [1 / P]})
+    res = verify_dr3(cat, xm, tmp_path, fetcher=lambda ids: {1: gaia}, lc_getter=lambda tic: lc, pages=True, n_boot=3)
+    r = res[0]
+    assert r["refit_status"] == "ok" and r["refit_n_sectors"] == 4
+    assert abs(r["refit_period"] - P) < 5 * r["refit_period_err"]
+    assert abs(r["catalog_drift_at_gaia"]) > 0.004                 # expected ~0.0058 for a 2e-5 d period error
+    assert r["offset_constrained"] and abs(r["offset_best_shift"]) < 3 * r["offset_shift_err"] + 5e-4
+    assert (tmp_path / "TIC1.01_oc.png").exists()
