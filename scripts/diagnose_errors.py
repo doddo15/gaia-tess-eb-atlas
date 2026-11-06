@@ -19,15 +19,16 @@ ap.add_argument("--curve-file", default="data/dr3_noise_curve.ecsv")
 a = ap.parse_args()
 
 res = Table.read(a.verification)
+truthy = lambda c: np.array([str(v).strip().lower() in ("true", "1") for v in c])   # CSV stores "True"/"False" text
 if "diag_chi2_red_in" not in res.colnames:
     raise SystemExit("No diag_* columns: rerun scripts/03_verify_dr3.py with the current code first.")
-con = np.asarray(res["offset_constrained"]).astype(bool)
+con = truthy(res["offset_constrained"])
 r = res[con]
 col = lambda c: np.asarray(r[c], float)
 cin, coot = col("diag_chi2_red_in"), col("diag_chi2_red_oot")
 cin_t, coot_t = col("diag_chi2_red_in_tnoise"), col("diag_chi2_red_oot_tnoise")
 ratio, g, rel = col("diag_oot_scatter_ratio"), col("diag_g_mag"), col("diag_rel_err_formal")
-contact = np.asarray(r["meas_contact_like"]).astype(str) == "True"
+contact = truthy(r["meas_contact_like"])
 
 print(f"{len(r)} constrained fits")
 print(f"  median chi2_red  in eclipse {np.nanmedian(cin):7.1f}   out of eclipse {np.nanmedian(coot):7.1f}")
@@ -47,10 +48,14 @@ if a.noise_curve:
         curve = Table.read(cf)
     else:
         curve = noise_curve(fetch_constant_stars()); cf.parent.mkdir(parents=True, exist_ok=True); curve.write(cf)
+    print(f"  noise curve covers G = {curve['g'].min():.2f}-{curve['g'].max():.2f}")
+    inside = (g >= curve["g"].min()) & (g <= curve["g"].max())
+    print(f"  targets inside the curve's magnitude range: {inside.sum()} of {len(g)}")
     lo, up = interp_curve(curve, g)
+    lo, up, rel_c = lo[inside], up[inside], rel[inside]
     print(f"  formal per-transit error vs constant-star noise at same G: "
-          f"below lower bound for {np.mean(rel < lo):.0%}, below upper bound for {np.mean(rel < up):.0%}")
-    print(f"  empirical/formal from curve (median): {np.nanmedian(lo / rel):.2f} - {np.nanmedian(up / rel):.2f}")
+          f"below lower bound for {np.mean(rel_c < lo):.0%}, below upper bound for {np.mean(rel_c < up):.0%}")
+    print(f"  empirical/formal from curve (median): {np.nanmedian(lo / rel_c):.2f} - {np.nanmedian(up / rel_c):.2f}")
 
 fig, ax = plt.subplots(1, 3, figsize=(15, 4.4), constrained_layout=True)
 for m, c, lab in ((contact, "#d1495b", "contact-like"), (~contact, "#1f5fbf", "detached")):

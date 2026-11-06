@@ -127,8 +127,13 @@ def main(argv=None):
     p.add_argument("--out", default="atlas"); p.add_argument("--release", choices=["dr3", "dr4"], default="dr3")
     p.add_argument("--xmatch", help="stage-1 cross-match file (required for --release dr4)")
     p.add_argument("--limit", type=int, default=None); p.add_argument("--no-tess", action="store_true")
+    p.add_argument("--refit", default=None, help="refit ephemerides from scripts/04_refit_tebc.py (used where ok)")
     a = p.parse_args(argv)
     cat = load_catalog(a.catalog, a.name)
+    if a.refit:
+        from .catalogs import apply_refit
+        cat = apply_refit(cat, a.refit)
+        print(f"ephemerides: {np.sum(cat['ephem_source'] == 'refit')} refit, {np.sum(cat['ephem_source'] == 'catalog')} catalog")
     if a.limit:
         cat = cat[: a.limit]
     if a.release == "dr3":

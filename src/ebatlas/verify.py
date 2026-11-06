@@ -45,35 +45,54 @@ def period_agreement(period, dr3_frequency, rtol=2e-3):
     return r, "mismatch"
 
 
-def phase_offset_scan(ephem, gaia_tab, template, band="G", span=None, n=801, min_dchi2=25.0,
-                      boot_templates=None):
-    """Best phase shift of the TESS template against the Gaia points of one band.
-
-    Model at each trial delta: flux = a + b * (template(phase - delta) - 1), fitted
-    with the Gaia errors (inflated by sqrt(chi2_min/dof) when the fit is worse than
-    they claim). shift_err combines (a) the half-width of delta-chi2 <= 4, halved,
-    which suits flat-bottomed chi^2 curves from few in-eclipse points, and (b) with
-    `boot_templates`, the scatter of best shifts across bootstrapped TESS templates,
-    i.e. the template's own noise, which the Gaia chi^2 cannot see.
-    `constrained` needs at least one Gaia point inside an eclipse of the best-fit
-    template AND a preferred shift by more than `min_dchi2`; out-of-eclipse
-    (ellipsoidal) signal alone does not count.
-    """
+def _gaia_points(gaia_tab, band):
+    from .plotting import MAX_NORM_FLUX
     sel = (np.asarray(gaia_tab["band"]) == band) & ~np.asarray(gaia_tab["rejected"]).astype(bool)
     f = np.asarray(gaia_tab["flux"], float)[sel]; e = np.asarray(gaia_tab["flux_err"], float)[sel]
     t = np.asarray(gaia_tab["btjd"], float)[sel]
+    mag = np.asarray(gaia_tab["mag"], float)[sel] if "mag" in gaia_tab.colnames else np.full(sel.sum(), np.nan)
     ok = np.isfinite(f) & np.isfinite(e) & (e > 0) & np.isfinite(t)
-    t, f, e = t[ok], f[ok], e[ok]
-    out = {"n_points": int(len(t)), "best_shift": np.nan, "shift_err": np.nan, "shift_err_template": np.nan,
-           "z": np.nan, "depth_scale": np.nan, "dchi2_max": np.nan, "chi2_red": np.nan, "constrained": False,
-           "sigma_phase_gaia": np.nan, "n_in_eclipse": 0}
-    if len(t) < 10:
-        return out
-    med = np.median(f); f, e = f / med, e / med
-    from .plotting import MAX_NORM_FLUX
-    keep = f < MAX_NORM_FLUX                      # brightenings cannot be eclipse signal
-    t, f, e = t[keep], f[keep], e[keep]
-    out["n_points"] = int(len(t))
+    t, f, e, mag = t[ok], f[ok], e[ok], mag[ok]
+    if len(f):
+        med = np.median(f); f, e = f / med, e / med
+        keep = f < MAX_NORM_FLUX
+        t, f, e, mag = t[keep], f[keep], e[keep], mag[keep]
+    return t, f, e, mag
+
+
+def _profile(chi2, shifts, k, level):
+    """Half of the full width of {chi2 - min <= level}, contiguous around k."""
+    d = chi2 - chi2[k]; n = len(shifts)
+    lo = hi = k
+    while lo > 0 and d[lo - 1] <= level:
+        lo -= 1
+    while hi < n - 1 and d[hi + 1] <= level:
+        hi += 1
+    return 0.5 * (shifts[hi] - shifts[lo])
+
+
+def phase_offset_scan(ephem, gaia_tab, template, band="G", span=None, n=801, min_dchi2=25.0,
+                      boot_templates=None, noise_curve=None, jackknife=True):
+    """Best phase shift of the TESS template against the Gaia points of one band.
+
+    Model at each trial shift: flux = a + b * (template(phase - shift) - 1), b > 0.
+    Errors follow errors.py: Gaia formal (+) instrumental floor at the source's G (+)
+    template noise from `boot_templates` (+) a per-source jitter fitted by maximum
+    likelihood to the out-of-eclipse residuals. The shift error is the profile width at
+    delta-chi2 = 1 under those errors; with `jackknife`, each in-eclipse transit is left
+    out in turn and the jackknife standard error is used if larger; `leverage` is the
+    largest single-transit change in units of the profile error (> 1: one point drives it).
+    `constrained` needs >= 1 Gaia point inside an eclipse of the best-fit template and a
+    preferred shift by more than `min_dchi2`.
+    """
+    from .errors import jitter_ml, instrumental_floor
+
+    t, f, e_formal, mag = _gaia_points(gaia_tab, band)
+    out = {"n_points": int(len(t)), "best_shift": np.nan, "shift_err": np.nan, "shift_err_profile": np.nan,
+           "shift_err_jackknife": np.nan, "leverage": np.nan, "z": np.nan, "depth_scale": np.nan,
+           "dchi2_max": np.nan, "chi2_red": np.nan, "chi2_red_formal": np.nan, "constrained": False,
+           "sigma_phase_gaia": np.nan, "n_in_eclipse": 0, "jitter": np.nan, "inst_floor": np.nan,
+           "template_noise_med": np.nan}
     if len(t) < 10:
         return out
     ph = ephem.phase(t)
@@ -81,33 +100,65 @@ def phase_offset_scan(ephem, gaia_tab, template, band="G", span=None, n=801, min
     out["sigma_phase_gaia"] = sig
     span = span or float(min(0.5, max(0.03, 6 * sig)))
     shifts = np.linspace(-span, span, n)
-    chi2, scale = _scan(ph, f, e, template, shifts)
-    k = int(np.argmin(chi2)); dof = max(len(t) - 3, 1)
-    infl = max(1.0, chi2[k] / dof)
-    d = chi2 - chi2[k]
-    inside = d <= 4.0 * infl
-    lo, hi = k, k
-    while lo > 0 and inside[lo - 1]:
-        lo -= 1
-    while hi < n - 1 and inside[hi + 1]:
-        hi += 1
-    err = max(0.25 * (shifts[hi] - shifts[lo]), shifts[1] - shifts[0])
-    terr = 0.0
+
+    g = float(np.nanmedian(mag)) if np.isfinite(mag).any() else np.nan
+    floor = instrumental_floor(noise_curve, g)
+    e1 = np.hypot(e_formal, floor)
+    out["inst_floor"] = floor
+
+    # pass 1: formal (+ floor) errors -> provisional shift
+    chi2, scale = _scan(ph, f, e1, template, shifts)
+    out["chi2_red_formal"] = float(np.min(chi2) / max(len(t) - 3, 1))
+    k = int(np.argmin(chi2))
+    # template noise at the provisional shift
+    tn = np.zeros(len(t))
     if boot_templates:
-        bs = [shifts[int(np.argmin(_scan(ph, f, e, bt, shifts)[0]))] for bt in boot_templates]
-        terr = float(np.std(bs))
-    grid = np.linspace(-0.5, 0.5, 4001)
-    tg = template(grid); base = np.median(tg); depth = (base - tg).max()
-    n_in = int(np.sum((base - template(ph - shifts[k])) > 0.2 * depth)) if depth > 0 else 0
-    tot = float(np.hypot(err, terr))
-    out.update(best_shift=float(shifts[k]), shift_err=tot, shift_err_template=terr,
-               depth_scale=float(scale[k]), dchi2_max=float(d.max() / infl), chi2_red=float(chi2[k] / dof),
-               n_in_eclipse=n_in, constrained=bool(d.max() / infl > min_dchi2 and 0 < k < n - 1 and n_in >= 1))
+        tn = np.std([bt(ph - shifts[k]) for bt in boot_templates], axis=0) * abs(scale[k])
+    out["template_noise_med"] = float(np.median(tn))
+    e2 = np.hypot(e1, tn)
+    # jitter from out-of-eclipse residuals at the provisional shift
+    grid = np.linspace(-0.5, 0.5, 4001); tg = template(grid); base = np.median(tg); depth = (base - tg).max()
+    m = template(ph - shifts[k]) - 1.0
+    inn = (base - template(ph - shifts[k])) > 0.2 * depth if depth > 0 else np.zeros(len(t), bool)
+    A = np.column_stack([np.ones_like(m), m])
+    p, *_ = np.linalg.lstsq(A / e2[:, None], f / e2, rcond=None)
+    oot = ~inn
+    jit = jitter_ml((f - A @ p)[oot], e2[oot]) if oot.sum() >= 5 else jitter_ml(f - A @ p, e2)
+    out["jitter"] = jit
+    e_eff = np.hypot(e2, jit)
+
+    # pass 2: effective errors
+    chi2, scale = _scan(ph, f, e_eff, template, shifts)
+    k = int(np.argmin(chi2)); dof = max(len(t) - 3, 1)
+    d = chi2 - chi2[k]
+    # 1-sigma from the profile; with few in-eclipse points the chi^2 curve is flat-bottomed and the
+    # delta-chi2 = 1 width is too narrow, so also take half the delta-chi2 = 4 (2-sigma) width.
+    err = max(_profile(chi2, shifts, k, 1.0), 0.5 * _profile(chi2, shifts, k, 4.0), shifts[1] - shifts[0])
+    inn = (base - template(ph - shifts[k])) > 0.2 * depth if depth > 0 else np.zeros(len(t), bool)
+    n_in = int(inn.sum())
+
+    jk_err, lev = np.nan, np.nan
+    if jackknife and n_in >= 2:
+        idx = np.where(inn)[0]
+        est = []
+        for i in idx:
+            keep = np.ones(len(t), bool); keep[i] = False
+            c2, _ = _scan(ph[keep], f[keep], e_eff[keep], template, shifts)
+            est.append(shifts[int(np.argmin(c2))])
+        est = np.array(est)
+        jk_err = float(np.sqrt((len(est) - 1) / len(est) * np.sum((est - est.mean()) ** 2)))
+        lev = float(np.max(np.abs(est - shifts[k])) / err)
+    tot = float(max(err, jk_err)) if np.isfinite(jk_err) else float(err)
+    out.update(best_shift=float(shifts[k]), shift_err=tot, shift_err_profile=float(err),
+               shift_err_jackknife=jk_err, leverage=lev, depth_scale=float(scale[k]),
+               dchi2_max=float(np.nanmax(d[np.isfinite(d)])), chi2_red=float(chi2[k] / dof), n_in_eclipse=n_in,
+               constrained=bool(np.nanmax(d[np.isfinite(d)]) > min_dchi2 and 0 < k < n - 1 and n_in >= 1))
+    out["shift_err_template"] = np.nan          # kept for older CSV readers; template noise now enters per point
     out["z"] = float(shifts[k] / np.hypot(tot, sig))
     return out
 
 
-def _analyse(base, lc, tab, n_boot, template=None):
+def _analyse(base, lc, tab, n_boot, template=None, noise_curve=None):
     """Eclipse geometry, template and Gaia offset scan on the given base ephemeris."""
     from .ephemeris import Ephemeris
     from .templates import shortest_cadence_mask
@@ -126,7 +177,7 @@ def _analyse(base, lc, tab, n_boot, template=None):
                     secondary_width=pick("secondary_width", base.secondary_width))
     tmpl = template if template is not None else tess_template(eph, t, f)
     boots = bootstrap_templates(eph, t, f, n=n_boot)
-    off = phase_offset_scan(eph, tab, tmpl, boot_templates=boots)
+    off = phase_offset_scan(eph, tab, tmpl, boot_templates=boots, noise_curve=noise_curve)
     off["_diag"] = chi2_breakdown(eph, tab, tmpl, off.get("best_shift", np.nan), boots)
     return eph, geom, off
 
@@ -135,7 +186,9 @@ def _refit_columns(fit, cat_eph, gaia_btjd):
     e = fit["ephem"]
     rec = {"refit_status": fit["status"], "refit_n_sectors": fit["n_sectors"],
            "refit_baseline_days": fit["baseline_days"], "refit_chi2_red": fit["chi2_red"],
-           "refit_quad_snr": fit["quad_snr"], "refit_period_shift_sigma": fit["period_shift_sigma"],
+           "refit_jitter_s": fit.get("jitter_s", np.nan), "refit_quad_snr": fit["quad_snr"],
+           "refit_period_shift_sigma": fit["period_shift_sigma"], "refit_n_outliers": fit.get("n_outliers", 0),
+           "refit_n_wide": fit.get("n_wide", 0), "refit_depth_scale_spread": fit.get("depth_scale_spread", np.nan),
            "template_exptime_s": fit["template_exptime"]}
     if fit["status"] == "ok":
         rec.update(refit_period=e.period, refit_period_err=e.period_err, refit_t0=e.t0, refit_t0_err=e.t0_err)
@@ -146,10 +199,17 @@ def _refit_columns(fit, cat_eph, gaia_btjd):
     return rec
 
 
-def fit_ok(off, max_chi2_red=20.0, scale_range=(0.2, 5.0)):
-    """Offset fits worth trusting: constrained, sensible depth scale, template matches the Gaia points."""
+def fit_ok(off, scale_range=(0.2, 5.0), max_leverage=2.0, min_in=2):
+    """Offset fits worth trusting.
+
+    With per-source jitter in the errors, chi2_red is ~1 by construction, so it no longer
+    measures fit quality. What still matters: the shift is constrained, the Gaia/TESS
+    depth scale is physical, at least `min_in` transits fall in eclipse, and no single
+    transit moves the shift by more than `max_leverage` profile errors.
+    """
+    lev = off.get("leverage", np.nan)
     return bool(off.get("constrained") and scale_range[0] < off.get("depth_scale", np.nan) < scale_range[1]
-                and off.get("chi2_red", np.inf) < max_chi2_red)
+                and off.get("n_in_eclipse", 0) >= min_in and (not np.isfinite(lev) or lev <= max_leverage))
 
 
 def chi2_breakdown(ephem, gaia_tab, template, shift, boot_templates=None, band="G", in_frac=0.2):
@@ -213,9 +273,11 @@ def _truthy(v):
 
 
 def verify_dr3(cat, xmatch, out_dir, fetcher=None, lc_getter=None, cache_dir="cache/dr3_epoch_photometry",
-               pages=True, limit=None, n_boot=10, refit=True):
+               pages=True, limit=None, n_boot=10, refit=True, noise_curve=None, tess_cache="cache/tess"):
     """Run the three checks for every catalog EB that has DR3 epoch photometry.
 
+    `noise_curve`: Table from noise.noise_curve (or a path to one) giving the instrumental
+    per-transit floor; without it the per-source jitter absorbs that noise.
     With refit=True (default) each ephemeris is first refit from all TESS sectors
     (ephemeris_fit.refit_ephemeris); the Gaia comparison then uses the refit ephemeris.
 
@@ -228,11 +290,15 @@ def verify_dr3(cat, xmatch, out_dir, fetcher=None, lc_getter=None, cache_dir="ca
     from .plotting import summarize, atlas_page
 
     out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
+    if noise_curve is not None and not isinstance(noise_curve, Table):
+        noise_curve = Table.read(noise_curve)
     if fetcher is None:
         from .gaia_epochs import fetch_dr3_epoch_photometry
         fetcher = lambda ids: fetch_dr3_epoch_photometry(ids, cache_dir=cache_dir)
     if lc_getter is None:
-        from .tess import fetch_tess_lc as lc_getter
+        from functools import partial
+        from .tess import fetch_tess_lc
+        lc_getter = partial(fetch_tess_lc, cache_dir=tess_cache)
 
     by_eb = {r["eb_id"]: r for r in cat}
     keep = [r for r in xmatch if int(r["dr3_source_id"]) > 0 and _truthy(r["dr3_has_epoch_photometry"])
@@ -269,7 +335,7 @@ def verify_dr3(cat, xmatch, out_dir, fetcher=None, lc_getter=None, cache_dir="ca
             fit = refit_ephemeris(cat, lc) if (refit and lc is not None) else None
             base = fit["ephem"] if fit is not None and fit["status"] == "ok" else cat
             tmpl = fit.get("template") if fit is not None and fit["status"] == "ok" else None
-            eph, geom, off = _analyse(base, lc, epochs[sid], n_boot, template=tmpl)
+            eph, geom, off = _analyse(base, lc, epochs[sid], n_boot, template=tmpl, noise_curve=noise_curve)
             return eph, geom, off, fit, cat
 
         eph, geom, off, fit, cat = attempt(1)
@@ -277,8 +343,9 @@ def verify_dr3(cat, xmatch, out_dir, fetcher=None, lc_getter=None, cache_dir="ca
         # binaries with near-equal eclipses. Try 2P and adopt it if it fits clearly better.
         if pclass == "double" and lc is not None:
             alt = attempt(2)
-            better = (alt[2].get("constrained") and np.isfinite(alt[2].get("chi2_red", np.nan))
-                      and alt[2]["chi2_red"] < 0.9 * off.get("chi2_red", np.inf))
+            # compare under formal errors: after jitter fitting both chi2_red are ~1 by construction
+            better = (alt[2].get("constrained") and np.isfinite(alt[2].get("chi2_red_formal", np.nan))
+                      and alt[2]["chi2_red_formal"] < 0.9 * off.get("chi2_red_formal", np.inf))
             other = (eph, geom, off, fit, cat) if better else alt
             rec.update({f"alt_offset_{k}": v for k, v in other[2].items() if not k.startswith("_")})
             rec["alt_period_factor"] = 1 if better else 2

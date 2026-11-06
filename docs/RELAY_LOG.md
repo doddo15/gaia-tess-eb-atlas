@@ -94,3 +94,26 @@ Short, dated entries: what you did, what's broken, what the next person should d
 - `scripts/diagnose_errors.py` summarises the chi2 split and (optionally) the noise-curve comparison.
 - **Next:** rerun verification on the same sample, then both diagnostics; decide the error model and the
   refit hardening from what they show.
+
+## 2026-11-05: diagnostics results, error model, refit hardening, catalog refit
+- Diagnostics (29 constrained fits; `diagnose_errors.py` had counted all 50 because CSV booleans were read
+  as text): chi2 excess is spread evenly (in-eclipse 22% of chi2, 24% of points) -> noise, not bandpass
+  mismatch. Out-of-eclipse scatter 7.7x formal errors (contact 9.0x, detached 6.5x); constant-star curve
+  says 1.7-5x is instrumental. Template noise 2.2x Gaia error in eclipse. Noise curve only covered G > 10.7.
+- Coverage: sectors 1-107; last product = last observed for 45/50 (others lack only sectors 104-107, not yet
+  at MAST). Short baselines = TESS pointing, not missing data. 500/558 sectors timed; failures concentrated
+  in 4 targets (TIC441808796: 11 negative-scale sectors).
+- New error model (`errors.py`): formal (+) instrumental floor at G (+) template noise (+) ML jitter from
+  out-of-eclipse residuals; offset error = max(profile, jackknife); leverage flag. Calibrated to ~30%.
+  `offset_fit_ok` now = constrained, depth scale 0.2-5, >=2 in-eclipse transits, leverage <= 2.
+- Refit hardening: positive-depth constraint in all scans; statuses flat/edge/no_fit; whole-orbit retry for
+  edge/no_fit; sector QC (bad_normalisation, noisy); depth-aligned shift-and-stack (per-sector a, b);
+  ML timing jitter instead of chi2 inflation; leave-one-out outlier clipping (>5 sigma); n_wide counts
+  first-pass whole-orbit retries; depth_scale_spread within a pipeline (variable eclipse depth).
+- Catalog refit: `scripts/04_refit_tebc.py` (`refit_catalog.py`, `refit_summary.py`): parallel, resumable,
+  per-target error capture; compact TESS cache (`tess.save_compact`, temp downloads deleted);
+  `catalogs.apply_refit` + `ebatlas-build --refit` so DR4 starts from refit ephemerides.
+- Fixes: diagnose_errors booleans; audit compares last product with last observed; noise curve sampled per
+  G bin; 2P adoption compares chi2 under formal errors.
+- **Next:** `04_refit_tebc.py --sample 100`, check timing/disk, then the full catalog; then DR3 verification
+  of all 1966 with the noise curve.

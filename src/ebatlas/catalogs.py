@@ -163,3 +163,30 @@ def row_to_ephemeris(row, **overrides):
         secondary_phase=val("secondary_phase", 0.5),
         secondary_width=val("secondary_width"),
     )
+
+
+def apply_refit(cat, refit, require_status="ok"):
+    """Copy of `cat` with ephemerides replaced by refit ones (matched on eb_id).
+
+    `refit`: table or path from scripts/04_refit_tebc.py. Rows whose refit status is not
+    `require_status` keep the catalog ephemeris. Adds `ephem_source` ('refit'|'catalog')
+    and copies measured eclipse geometry when the catalog has none.
+    """
+    if not isinstance(refit, Table):
+        refit = Table.read(refit)
+    by = {str(r["eb_id"]): r for r in refit if str(r["status"]) == require_status}
+    out = cat.copy()
+    src = []
+    for i, r in enumerate(out):
+        x = by.get(str(r["eb_id"]))
+        if x is None:
+            src.append("catalog"); continue
+        for col, rc in (("period", "refit_period"), ("period_err", "refit_period_err"),
+                        ("t0_btjd", "refit_t0"), ("t0_err", "refit_t0_err")):
+            out[col][i] = float(x[rc])
+        for col in ("primary_width", "secondary_phase", "secondary_width"):
+            if col in refit.colnames and not np.isfinite(out[col][i]) and np.isfinite(x[col]):
+                out[col][i] = float(x[col])
+        src.append("refit")
+    out["ephem_source"] = src
+    return out

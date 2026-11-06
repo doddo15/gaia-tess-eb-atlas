@@ -32,14 +32,24 @@ WHERE random_index < {max_index}
 """
 
 
-def fetch_constant_stars(n=50000, gmin=6.0, gmax=20.0, max_index=20_000_000):
-    """Random sample of DR3 sources not flagged variable (one TAP query)."""
+def fetch_constant_stars(n_per_bin=1000, bins=np.arange(5.0, 20.51, 0.5)):
+    """DR3 sources not flagged variable, sampled bin by bin in G.
+
+    A single random sample is almost all faint stars (bright ones are rare), which
+    left the bright end of the curve empty. Each bin gets its own query; the
+    random_index cut is loosened for bright bins so they still fill up.
+    """
+    from astropy.table import vstack
     from astroquery.gaia import Gaia
-    q = NOISE_QUERY.format(n=int(n), gmin=gmin, gmax=gmax, max_index=int(max_index))
-    return Gaia.launch_job_async(q).get_results()
+    parts = []
+    for a, b in zip(bins[:-1], bins[1:]):
+        cap = 1_900_000_000 if a < 13 else (200_000_000 if a < 16 else 20_000_000)
+        q = NOISE_QUERY.format(n=int(n_per_bin), gmin=a, gmax=b, max_index=cap)
+        parts.append(Gaia.launch_job_async(q).get_results())
+    return vstack(parts)
 
 
-def noise_curve(stars, bins=np.arange(6.0, 20.51, 0.5)):
+def noise_curve(stars, bins=np.arange(5.0, 20.51, 0.5)):
     """Median relative per-transit noise bounds per G bin -> Table(g, upper, lower, n)."""
     g = np.asarray(stars["phot_g_mean_mag"], float)
     f = np.asarray(stars["phot_g_mean_flux"], float)

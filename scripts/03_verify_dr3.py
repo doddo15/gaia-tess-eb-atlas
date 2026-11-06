@@ -26,6 +26,9 @@ ap.add_argument("--sample", type=int, default=None, help="random subset of this 
 ap.add_argument("--seed", type=int, default=0)
 ap.add_argument("--min-period", type=float, default=None); ap.add_argument("--max-period", type=float, default=None)
 ap.add_argument("--no-refit", action="store_true", help="use catalog ephemerides as published")
+ap.add_argument("--noise-curve", default="data/dr3_noise_curve.ecsv",
+                help="instrumental noise floor (from diagnose_errors.py --noise-curve); used if the file exists")
+ap.add_argument("--tess-cache", default="cache/tess")
 a = ap.parse_args()
 
 cat = load_catalog(a.catalog, "tebc")
@@ -40,7 +43,11 @@ has = np.array([str(v).strip().lower() in ("true", "1") for v in xm["dr3_has_epo
 xm = xm[has & (xm["dr3_source_id"] > 0)]
 if a.sample and a.sample < len(xm):
     xm = xm[np.sort(np.random.default_rng(a.seed).choice(len(xm), a.sample, replace=False))]
-res = verify_dr3(cat, xm, a.out, cache_dir=a.cache, pages=not a.no_pages, limit=a.limit, refit=not a.no_refit)
+from pathlib import Path
+nc = a.noise_curve if a.noise_curve and Path(a.noise_curve).exists() else None
+print(f"instrumental noise floor: {nc or 'none (per-source jitter absorbs it)'}")
+res = verify_dr3(cat, xm, a.out, cache_dir=a.cache, pages=not a.no_pages, limit=a.limit, refit=not a.no_refit,
+                 noise_curve=nc, tess_cache=a.tess_cache)
 
 n = len(res)
 print(f"{n} TEBC systems with DR3 epoch photometry checked")
@@ -60,9 +67,12 @@ if n:
     if "offset_constrained" in res.colnames:
         con = np.asarray(res["offset_constrained"]).astype(bool)
         good = np.asarray(res["offset_fit_ok"]).astype(bool) if "offset_fit_ok" in res.colnames else con
-        print(f"  phase offset constrained: {con.sum()}; good fits (χ²_red<20, sane depth scale): {good.sum()}")
+        print(f"  phase offset constrained: {con.sum()}; good fits (sane depth scale, >=2 in-eclipse transits, "
+              f"no single-transit leverage): {good.sum()}")
         if con.any():
-            print(f"    median χ²_red of constrained fits: {np.nanmedian(np.asarray(res['offset_chi2_red'], float)[con]):.1f}")
+            jit = np.asarray(res["offset_jitter"], float)[con]
+            print(f"    median χ²_red under formal errors {np.nanmedian(np.asarray(res['offset_chi2_red_formal'], float)[con]):.1f}; "
+                  f"median fitted jitter {np.nanmedian(jit) * 1e3:.1f} mmag")
         if good.any():
             z = np.asarray(res["offset_z"], float)[good]
             print(f"    good fits with |z| < 3: {np.mean(np.abs(z) < 3):.0%}")

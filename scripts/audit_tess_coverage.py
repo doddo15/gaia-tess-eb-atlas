@@ -61,8 +61,10 @@ print(f"  observed sectors per target: median {np.median(col('n_observed')):.0f}
 print(f"  with a SPOC/TESS-SPOC/QLP product: median {np.median(col('n_with_product')):.0f}; "
       f"targets missing >=1 observed sector: {np.sum(col('n_missing') > 0)} "
       f"(median {np.median(col('n_missing')):.0f} missing)")
-print(f"  latest product sector per target: median {np.median(col('last_product')):.0f}; "
-      f"targets whose latest product is >10 sectors before the cutoff: {np.sum(col('last_product') < max_sector - 10)}")
+gap = col("last_observed") - col("last_product")
+print(f"  earliest sector with a product: {int(col('first_product').min())}; latest: {int(col('last_product').max())}")
+print(f"  last product == last observed sector for {np.sum(gap == 0)} of {n}; "
+      f"behind by >=1 sector: {np.sum(gap > 0)} (usually the newest sectors, not yet at MAST)")
 if "n_timed" in aud.colnames:
     print(f"  timed in refit: median {np.nanmedian(col('n_timed')):.0f} sectors; "
           f"untimed reasons (totals): " + ", ".join(f"{k[2:]}={int(np.nansum(col(k)))}" for k in

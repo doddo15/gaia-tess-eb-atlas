@@ -140,8 +140,12 @@ def bootstrap_templates(ephem, t, flux, n=10, seed=0, **kw):
     return out
 
 
-def _scan(ph, f, e, template, shifts):
-    """Vectorised weighted fit of flux = a + b*(template(ph - s) - 1) for every shift s."""
+def _scan(ph, f, e, template, shifts, positive=True, return_offset=False):
+    """Vectorised weighted fit of flux = a + b*(template(ph - s) - 1) for every shift s.
+
+    With `positive`, shifts whose best scale b is <= 0 get chi2 = inf: an eclipse
+    template anti-correlated with the data is not a fit, it is a misalignment.
+    """
     M = np.stack([template(ph - s) - 1.0 for s in shifts])            # (n_shift, n_pts)
     w = 1.0 / e**2
     S, Sx, Sy = w.sum(), M @ w, (w * f).sum()
@@ -151,6 +155,9 @@ def _scan(ph, f, e, template, shifts):
     b = (S * Sxy - Sx * Sy) / det
     a = (Sy - b * Sx) / S
     chi2 = (((f[None, :] - a[:, None] - b[:, None] * M) ** 2) * w[None, :]).sum(axis=1)
-    return np.nan_to_num(chi2, nan=np.inf), b
+    chi2 = np.nan_to_num(chi2, nan=np.inf)
+    if positive:
+        chi2 = np.where(b > 0, chi2, np.inf)
+    return (chi2, b, a) if return_offset else (chi2, b)
 
 

@@ -81,7 +81,7 @@ def test_double_period_refold(tmp_path):
                      pages=False, n_boot=3)
     assert res["period_check"][0] == "double"
     assert res["adopted_period_factor"][0] == 2
-    assert res["offset_chi2_red"][0] < 0.9 * res["alt_offset_chi2_red"][0]
+    assert res["offset_chi2_red_formal"][0] < 0.9 * res["alt_offset_chi2_red_formal"][0]
 
 
 def test_tess_and_gaia_share_normalisation():
